@@ -63,14 +63,39 @@ def create_workspace(output_root: str | Path = "output/multiview_refine", job_id
     return ws
 
 
-def unpack_multiview_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -> MultiViewWorkspace:
-    zip_path = Path(zip_path)
-    if not zip_path.exists():
-        raise FileNotFoundError(f"ZIP not found: {zip_path}")
-    with zipfile.ZipFile(zip_path, "r") as zipf:
-        _safe_extract(zipf, workspace.root)
-    _normalize_single_top_folder(workspace.root)
-    workspace.write_state(input_zip=str(zip_path), unpacked=True)
+def unpack_camera_images_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -> MultiViewWorkspace:
+    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_upload_camera_images")
+    content_root = _single_top_folder(source_root)
+    image_source = content_root / "images" if (content_root / "images").is_dir() else content_root
+    image_files = _image_files(image_source)
+    if not image_files:
+        raise FileNotFoundError(f"No images found in camera image ZIP: {zip_path}")
+    if workspace.images_dir.exists():
+        shutil.rmtree(workspace.images_dir)
+    workspace.images_dir.mkdir(parents=True, exist_ok=True)
+    for image_path in image_files:
+        shutil.copy2(image_path, workspace.images_dir / image_path.name)
+    shutil.rmtree(source_root)
+    workspace.write_state(camera_images_zip=str(zip_path), camera_images=len(image_files))
+    return workspace
+
+
+def unpack_layer1_lam_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -> MultiViewWorkspace:
+    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_upload_layer1_lam")
+    content_root = _single_top_folder(source_root)
+
+    init_ply = _find_layer1_canonical_ply(content_root)
+    canonical_flame = _find_canonical_flame_param(content_root)
+    if canonical_flame is None:
+        raise FileNotFoundError(
+            "Layer 1 LAM package must contain canonical_flame_param.npz or *_canonical_flame_param.npz."
+        )
+
+    shutil.copy2(init_ply, workspace.root / "init.ply")
+    shutil.copy2(canonical_flame, workspace.root / "canonical_flame_param.npz")
+    _copy_layer1_frame_params(content_root, workspace.root / "layer1_frame_param")
+    shutil.rmtree(source_root)
+    workspace.write_state(layer1_lam_zip=str(zip_path), init_ply="init.ply", canonical_flame_param="canonical_flame_param.npz")
     return workspace
 
 
@@ -146,25 +171,80 @@ def _safe_extract(zipf: zipfile.ZipFile, target_root: Path) -> None:
     zipf.extractall(target_root)
 
 
-def _normalize_single_top_folder(root: Path) -> None:
-    children = [p for p in root.iterdir() if p.name not in {"debug", "checkpoints", "workspace_state.json"}]
+def _extract_zip_to_temp(zip_path: str | Path, target_root: Path) -> Path:
+    zip_path = Path(zip_path)
+    if not zip_path.exists():
+        raise FileNotFoundError(f"ZIP not found: {zip_path}")
+    if target_root.exists():
+        shutil.rmtree(target_root)
+    target_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        _safe_extract(zipf, target_root)
+    return target_root
+
+
+def _single_top_folder(root: Path) -> Path:
+    children = [p for p in root.iterdir() if not p.name.startswith("__MACOSX")]
     dirs = [p for p in children if p.is_dir()]
     files = [p for p in children if p.is_file()]
-    if len(dirs) != 1 or files:
+    if len(dirs) == 1 and not files:
+        return dirs[0]
+    return root
+
+
+def _image_files(root: Path) -> list[Path]:
+    return sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
+
+
+def _find_layer1_canonical_ply(root: Path) -> Path:
+    ply_files = sorted([p for p in root.rglob("*.ply") if p.is_file()])
+    if not ply_files:
+        raise FileNotFoundError("Layer 1 LAM package must contain a canonical Gaussian .ply.")
+    preferred = [p for p in ply_files if "canonical" in p.stem.lower() and "offset" not in p.stem.lower()]
+    if preferred:
+        return preferred[0]
+    init_named = [p for p in ply_files if p.name.lower() == "init.ply"]
+    if init_named:
+        return init_named[0]
+    non_offset = [p for p in ply_files if "offset" not in p.stem.lower()]
+    if len(non_offset) == 1:
+        return non_offset[0]
+    offset_only = ", ".join(p.name for p in ply_files[:5])
+    raise ValueError(
+        "Layer 1 LAM package must provide absolute canonical Gaussian xyz, e.g. *_canonical.ply or init.ply. "
+        f"Refusing ambiguous/offset-only PLY files: {offset_only}"
+    )
+
+
+def _find_canonical_flame_param(root: Path) -> Optional[Path]:
+    candidates = sorted([p for p in root.rglob("*.npz") if p.is_file()])
+    exact = [p for p in candidates if p.name == "canonical_flame_param.npz"]
+    if exact:
+        return exact[0]
+    suffix = [p for p in candidates if p.name.endswith("_canonical_flame_param.npz")]
+    if suffix:
+        return suffix[0]
+    return None
+
+
+def _copy_layer1_frame_params(root: Path, dst: Path) -> None:
+    candidates = [
+        p for p in root.rglob("*.npz")
+        if p.is_file() and p.name != "canonical_flame_param.npz" and not p.name.endswith("_canonical_flame_param.npz")
+    ]
+    if (root / "flame_param").is_dir():
+        candidates.extend([p for p in (root / "flame_param").glob("*.npz") if p.is_file()])
+    if not candidates:
         return
-    top = dirs[0]
-    expected = {"images", "masks", "fg_masks", "flame_param", "colmap"}
-    if not any((top / name).exists() for name in expected):
-        return
-    for child in top.iterdir():
-        target = root / child.name
-        if target.exists():
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    for src in sorted(candidates):
+        if src.resolve() in seen:
             continue
-        shutil.move(str(child), str(target))
-    try:
-        top.rmdir()
-    except OSError:
-        pass
+        seen.add(src.resolve())
+        shutil.copy2(src, dst / src.name)
 
 
 def _jsonable(value):

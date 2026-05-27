@@ -54,12 +54,16 @@ def _latest_refine_gallery(workspace, stage):
     return _gallery(steps[-1])
 
 
-def create_workspace(output_root, job_id, zip_file, init_ply):
+def create_workspace(output_root, job_id, camera_images_zip, layer1_lam_zip):
     pipe = MultiViewRefinePipeline.create(output_root or "output/multiview_refine", job_id or None)
-    if zip_file:
-        zip_path = zip_file.name if hasattr(zip_file, "name") else zip_file
-        init_path = init_ply.name if hasattr(init_ply, "name") else init_ply
-        result = pipe.unpack(zip_path, init_path)
+    if camera_images_zip or layer1_lam_zip:
+        if not camera_images_zip:
+            raise gr.Error("Upload Camera Multi-view Images ZIP.")
+        if not layer1_lam_zip:
+            raise gr.Error("Upload Layer 1 LAM Canonical Package ZIP.")
+        camera_zip_path = camera_images_zip.name if hasattr(camera_images_zip, "name") else camera_images_zip
+        layer1_zip_path = layer1_lam_zip.name if hasattr(layer1_lam_zip, "name") else layer1_lam_zip
+        result = pipe.unpack_uploads(camera_zip_path, layer1_zip_path)
         return str(pipe.workspace.root), result.message, _gallery(result.path)
     return str(pipe.workspace.root), "Workspace created.", []
 
@@ -138,11 +142,15 @@ def launch():
                 output_root = gr.Textbox(label="Output Root", value="output/multiview_refine")
                 job_id = gr.Textbox(label="Job ID (optional)")
             with gr.Row():
-                zip_file = gr.File(label="Multi-view ZIP", file_types=[".zip"])
-                init_ply_upload = gr.File(label="Initial Gaussian PLY", file_types=[".ply"])
-            create_btn = gr.Button("Create Workspace / Unpack", variant="primary")
+                with gr.Group():
+                    gr.Markdown("### Camera multi-view images")
+                    camera_images_zip = gr.File(label="Camera Images ZIP", file_types=[".zip"])
+                with gr.Group():
+                    gr.Markdown("### Layer 1 LAM canonical package")
+                    layer1_lam_zip = gr.File(label="LAM Canonical Package ZIP", file_types=[".zip"])
+            create_btn = gr.Button("Create Workspace / Unpack Uploads", variant="primary")
             workspace_gallery = gr.Gallery(label="Input Preview", columns=2, height=480)
-            create_btn.click(create_workspace, [output_root, job_id, zip_file, init_ply_upload], [workspace, status, workspace_gallery])
+            create_btn.click(create_workspace, [output_root, job_id, camera_images_zip, layer1_lam_zip], [workspace, status, workspace_gallery])
 
         with gr.Tab("1. Import"):
             image_dir = gr.Textbox(label="Images Dir")

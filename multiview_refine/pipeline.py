@@ -1,5 +1,4 @@
 import json
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,7 +20,14 @@ from .visualization import (
     save_transform_camera_plot,
     save_workspace_image_previews,
 )
-from .workspace import MultiViewWorkspace, create_workspace, import_local_inputs, unpack_multiview_zip, validate_workspace_inputs
+from .workspace import (
+    MultiViewWorkspace,
+    create_workspace,
+    import_local_inputs,
+    unpack_camera_images_zip,
+    unpack_layer1_lam_zip,
+    validate_workspace_inputs,
+)
 
 
 @dataclass
@@ -41,13 +47,17 @@ class MultiViewRefinePipeline:
     def create(cls, output_root: str | Path = "output/multiview_refine", job_id: Optional[str] = None) -> "MultiViewRefinePipeline":
         return cls(create_workspace(output_root, job_id))
 
-    def unpack(self, zip_path: str | Path, init_ply: Optional[str | Path] = None) -> StepResult:
-        unpack_multiview_zip(zip_path, self.workspace)
-        if init_ply:
-            shutil.copy2(init_ply, self.workspace.root / "init.ply")
+    def unpack_uploads(self, camera_images_zip: Optional[str | Path] = None, layer1_lam_zip: Optional[str | Path] = None) -> StepResult:
+        if camera_images_zip:
+            unpack_camera_images_zip(camera_images_zip, self.workspace)
+        if layer1_lam_zip:
+            unpack_layer1_lam_zip(layer1_lam_zip, self.workspace)
         report = validate_workspace_inputs(self.workspace, require_masks=False)
         debug_dir = self._save_workspace_preview("inputs")
-        return StepResult(f"Workspace ready. Images: {report['num_images']}, masks: {report['num_masks']}", str(debug_dir))
+        return StepResult(
+            f"Workspace ready. Images: {report['num_images']}, masks: {report['num_masks']}, init_ply: {report['has_init_ply']}",
+            str(debug_dir),
+        )
 
     def import_inputs(
         self,
