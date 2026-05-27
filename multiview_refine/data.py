@@ -10,19 +10,16 @@ from PIL import Image
 from .types import FLAME_KEYS, MultiViewBatch, MultiViewFrame, TensorDict
 
 
-REQUIRED_FLAME_KEYS = {
-    "expr",
-    "rotation",
-    "neck_pose",
-    "jaw_pose",
-    "eyes_pose",
-    "translation",
-    "betas",
-}
+REQUIRED_FLAME_KEYS = FLAME_KEYS - {"teeth_bs"}
 
 
-def load_multiview_bundle(root: str | Path, transforms_name: str = "transforms_aligned.json", bg_color: float = 1.0) -> MultiViewBatch:
-    frames = load_frames(root, transforms_name)
+def load_multiview_bundle(
+    root: str | Path,
+    transforms_name: str = "transforms_aligned.json",
+    bg_color: float = 1.0,
+    require_undistorted: bool = True,
+) -> MultiViewBatch:
+    frames = load_frames(root, transforms_name, require_undistorted=require_undistorted)
     images, masks = [], []
     image_size = None
     for frame in frames:
@@ -32,6 +29,9 @@ def load_multiview_bundle(root: str | Path, transforms_name: str = "transforms_a
             image_size = current_size
         elif current_size != image_size:
             raise ValueError(f"All images must have the same H/W. Got {current_size} for {frame.image_path}, expected {image_size}.")
+        _validate_intrinsics_match_image(frame.intr, current_size, frame.image_path)
+        if frame.landmarks_2d is not None:
+            _validate_landmarks(frame.landmarks_2d, current_size, frame.landmark_path)
         images.append(image)
         masks.append(mask)
     flame_params = _stack_flame_params(frames)
@@ -49,7 +49,7 @@ def load_multiview_bundle(root: str | Path, transforms_name: str = "transforms_a
     )
 
 
-def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.json") -> List[MultiViewFrame]:
+def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.json", require_undistorted: bool = True) -> List[MultiViewFrame]:
     root = Path(root)
     transforms_path = root / transforms_name
     if not transforms_path.exists():
@@ -59,6 +59,12 @@ def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.jso
     db = json.loads(transforms_path.read_text(encoding="utf-8"))
     frames = []
     for idx, item in enumerate(sorted(db["frames"], key=lambda f: f.get("flame_param_path") or f.get("file_path") or f.get("image_name", ""))):
+        if require_undistorted and item.get("requires_undistorted"):
+            model = item.get("camera_model", "unknown")
+            raise ValueError(
+                f"Frame {idx} uses COLMAP camera model {model} with distortion parameters. "
+                "Use COLMAP undistorted/PINHOLE images or set require_undistorted=False for diagnostics only."
+            )
         image_value = item.get("file_path") or item.get("image_path") or item.get("image_name")
         if not image_value:
             raise KeyError(f"Frame {idx} is missing file_path/image_path/image_name")
@@ -129,6 +135,32 @@ def _load_intr(frame: dict) -> torch.Tensor:
     intr[0, 2] = float(frame["cx"])
     intr[1, 2] = float(frame["cy"])
     return intr
+
+
+def _validate_intrinsics_match_image(intr: torch.Tensor, image_hw: tuple[int, int], image_path: Path) -> None:
+    h, w = image_hw
+    fx, fy, cx, cy = [float(v) for v in (intr[0, 0], intr[1, 1], intr[0, 2], intr[1, 2])]
+    if fx <= 0 or fy <= 0:
+        raise ValueError(f"Invalid non-positive focal length for {image_path.name}: fx={fx}, fy={fy}")
+    if not (-w <= cx <= 2 * w and -h <= cy <= 2 * h):
+        raise ValueError(
+            f"Principal point for {image_path.name} is not in the same pixel coordinate scale as the image: "
+            f"cx={cx}, cy={cy}, image={w}x{h}"
+        )
+
+
+def _validate_landmarks(landmarks: torch.Tensor, image_hw: tuple[int, int], path: Optional[Path]) -> None:
+    finite = landmarks[..., :2][torch.isfinite(landmarks[..., :2])]
+    if finite.numel() == 0:
+        return
+    h, w = image_hw
+    max_value = float(finite.max())
+    min_value = float(finite.min())
+    if max_value <= 2.0:
+        return
+    if min_value < -max(w, h) or max_value > 2 * max(w, h):
+        name = path.name if path else "landmarks"
+        raise ValueError(f"{name} landmarks do not appear to share image pixel coordinates for image size {w}x{h}.")
 
 
 def _load_rgb_mask(image_path: Path, mask_path: Optional[Path], bg_color: float) -> tuple[torch.Tensor, torch.Tensor]:

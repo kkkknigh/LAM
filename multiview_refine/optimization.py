@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from lam.models.rendering.gaussian_model import GaussianModel
 
+from .render_adapter import render_animate_gs_with_intrinsics
 from .types import MultiViewBatch, TensorDict
 from .visualization import append_jsonl, save_overlay_grid
 
@@ -54,6 +55,10 @@ class RefinementStageConfig:
     use_ssim: bool = True
     use_landmark: bool = False
     use_knn_anchor: bool = False
+    lr_decay_xyz: float = 0.2
+    lr_decay_appearance: float = 0.5
+    lr_decay_camera: float = 1.0
+    lr_decay_expression: float = 1.0
 
 
 @dataclass
@@ -113,6 +118,9 @@ class RefinementConfig:
     output_dir: str = "output/multiview_refine/run"
     knn_k: int = 6
     knn_max_points: int = 30000
+    require_undistorted: bool = True
+    use_local_projection_adapter: bool = True
+    log_grad_diagnostics: bool = True
 
 
 @dataclass
@@ -137,13 +145,18 @@ class MultiViewGaussianRefiner:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         device = torch.device(self.config.device)
         batch = batch.to(device=device, dtype=self.config.dtype)
-        gs_state = OptimizableGaussianState(initial_gs, knn_k=self.config.knn_k, knn_max_points=self.config.knn_max_points).to(device=device)
+        query_points, flame_params = self.renderer.get_query_points(batch.flame_params, device=device)
+        gs_state = OptimizableGaussianState(
+            initial_gs,
+            query_points=query_points,
+            knn_k=self.config.knn_k,
+            knn_max_points=self.config.knn_max_points,
+        ).to(device=device)
         camera_state = OptimizableCameraState(batch.c2ws.shape[1]).to(device=device)
         intr_state = OptimizableIntrinsicsState(batch.c2ws.shape[1]).to(device=device)
         exposure_state = OptimizableExposureState(batch.c2ws.shape[1]).to(device=device)
         expr_state = OptimizableExpressionState(batch.flame_params).to(device=device)
         sampler = RoundRobinViewSampler(batch.c2ws.shape[1], device=device)
-        query_points, flame_params = self.renderer.get_query_points(batch.flame_params, device=device)
         start_stage, start_step = 0, 0
         if resume:
             start_stage, start_step = self._load_checkpoint(resume, gs_state, camera_state, intr_state, exposure_state, expr_state)
@@ -151,7 +164,7 @@ class MultiViewGaussianRefiner:
         for stage_idx, stage in enumerate(self.config.stages):
             if stage_idx < start_stage:
                 continue
-            optimizer = self._build_optimizer(gs_state, camera_state, intr_state, exposure_state, expr_state, stage)
+            optimizer, scheduler = self._build_optimizer(gs_state, camera_state, intr_state, exposure_state, expr_state, stage)
             first_step = start_step if stage_idx == start_stage else 0
             sampler.reset()
             for step in range(first_step, stage.steps):
@@ -173,7 +186,10 @@ class MultiViewGaussianRefiner:
                     stage,
                 )
                 losses["total"].backward()
+                if self.config.log_grad_diagnostics and step == first_step:
+                    self._log_grad_diagnostics(stage.name, step + 1, gs_state, camera_state, intr_state, exposure_state, expr_state)
                 optimizer.step()
+                scheduler.step()
 
                 metric = float(losses["total"].detach().cpu())
                 if metric < self.best_metric:
@@ -195,8 +211,11 @@ class MultiViewGaussianRefiner:
         torch.save(intr_state.state_dict(), self.output_dir / "intrinsics_delta.pt")
         torch.save(exposure_state.state_dict(), self.output_dir / "exposure_delta.pt")
         torch.save(expr_state.state_dict(), self.output_dir / "pose_delta.pt")
+        torch.save(gs_state.geometry_delta_state_dict(), self.output_dir / "gaussian_geometry_delta.pt")
         with (self.output_dir / "refine_config.json").open("w", encoding="utf-8") as fp:
-            json.dump(_config_to_json(self.config), fp, indent=2)
+            raw = asdict(self.config)
+            raw["dtype"] = str(self.config.dtype)
+            json.dump(raw, fp, indent=2)
         return refined
 
     def _render(
@@ -215,16 +234,11 @@ class MultiViewGaussianRefiner:
         flame_params = expr_state.apply(flame_params, batch.view_indices) if stage.optimize_expression else flame_params
         c2ws = camera_state(batch.c2ws, batch.view_indices)
         intrs = intr_state(batch.intrs, batch.view_indices)
-        render = self.renderer.forward_animate_gs(
-            [gs_state.to_gaussian_model()],
-            query_points,
-            flame_params,
-            c2ws,
-            intrs,
-            h,
-            w,
-            batch.bg_colors,
-        )
+        gs_model = gs_state.to_gaussian_model()
+        if self.config.use_local_projection_adapter:
+            render = render_animate_gs_with_intrinsics(self.renderer, [gs_model], query_points, flame_params, c2ws, intrs, h, w, batch.bg_colors)
+        else:
+            render = self.renderer.forward_animate_gs([gs_model], query_points, flame_params, c2ws, intrs, h, w, batch.bg_colors)
         render = dict(render)
         render["comp_rgb"] = exposure_state.apply(render["comp_rgb"], batch.view_indices)
         landmarks = None
@@ -243,17 +257,47 @@ class MultiViewGaussianRefiner:
         exposure_state.set_trainable(stage.optimize_exposure)
         expr_state.set_trainable(stage.optimize_expression)
         groups = []
-        _add_group(groups, [camera_state.delta_log_scale, camera_state.global_axis_angle, camera_state.global_translation], stage.lr)
-        _add_group(groups, [camera_state.per_view_axis_angle, camera_state.per_view_translation], stage.lr * 0.25)
-        _add_group(groups, list(intr_state.parameters()), stage.lr * 0.1)
-        _add_group(groups, list(exposure_state.parameters()), stage.lr)
-        _add_group(groups, [gs_state.shs], stage.lr)
-        _add_group(groups, [gs_state.opacity_logit, gs_state.log_scaling, gs_state.rotation], stage.lr * 0.25)
-        _add_group(groups, [gs_state.xyz, gs_state.offset], stage.lr * 0.05)
-        _add_group(groups, list(expr_state.parameters()), stage.lr * 0.5)
+        _add_group(groups, [camera_state.delta_log_scale, camera_state.global_axis_angle, camera_state.global_translation], stage.lr, stage.lr_decay_camera)
+        _add_group(groups, [camera_state.per_view_axis_angle, camera_state.per_view_translation], stage.lr * 0.25, stage.lr_decay_camera)
+        _add_group(groups, list(intr_state.parameters()), stage.lr * 0.1, stage.lr_decay_camera)
+        _add_group(groups, list(exposure_state.parameters()), stage.lr, stage.lr_decay_appearance)
+        _add_group(groups, [gs_state.shs], stage.lr, stage.lr_decay_appearance)
+        _add_group(groups, [gs_state.opacity_logit, gs_state.log_scaling, gs_state.rotation], stage.lr * 0.25, stage.lr_decay_xyz)
+        _add_group(groups, [gs_state.xyz_delta, gs_state.offset_delta], stage.lr * 0.05, stage.lr_decay_xyz)
+        _add_group(groups, list(expr_state.parameters()), stage.lr * 0.5, stage.lr_decay_expression)
         if not groups:
             raise ValueError(f"Stage {stage.name} has no trainable parameters")
-        return torch.optim.Adam(groups)
+        optimizer = torch.optim.Adam(groups)
+        gammas = []
+        for group in optimizer.param_groups:
+            decay_ratio = float(group.pop("_decay_ratio", 0.5))
+            gammas.append(decay_ratio ** (1.0 / max(stage.steps, 1)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lambda step, g=g: g ** step for g in gammas])
+        return optimizer, scheduler
+
+    def _log_grad_diagnostics(self, stage: str, step: int, gs_state, camera_state, intr_state, exposure_state, expr_state) -> None:
+        diagnostics = {
+            "stage": stage,
+            "step": step,
+            "shs": _grad_norm([gs_state.shs]),
+            "offset_delta": _grad_norm([gs_state.offset_delta]),
+            "xyz_delta": _grad_norm([gs_state.xyz_delta]),
+            "log_scaling": _grad_norm([gs_state.log_scaling]),
+            "rotation": _grad_norm([gs_state.rotation]),
+            "opacity_logit": _grad_norm([gs_state.opacity_logit]),
+            "camera_global": _grad_norm([camera_state.delta_log_scale, camera_state.global_axis_angle, camera_state.global_translation]),
+            "camera_per_view": _grad_norm([camera_state.per_view_axis_angle, camera_state.per_view_translation]),
+            "intrinsics": _grad_norm(list(intr_state.parameters())),
+            "exposure": _grad_norm(list(exposure_state.parameters())),
+            "expression": _grad_norm(list(expr_state.parameters())),
+        }
+        append_jsonl(self.output_dir / "grad_diagnostics.jsonl", diagnostics)
+        print(f"[multiview-refine:{stage}] grad diagnostics {diagnostics}")
+        if (diagnostics["camera_global"] + diagnostics["camera_per_view"] + diagnostics["intrinsics"]) <= 1e-12:
+            print(
+                f"[multiview-refine:{stage}] warning: camera/intrinsics gradients are zero or unavailable; "
+                "use manual/explicit Sim3 alignment if calibration does not move."
+            )
 
     def _save_debug(self, stage: str, step: int, batch: MultiViewBatch, render: Dict[str, torch.Tensor]) -> None:
         save_overlay_grid(
@@ -321,18 +365,36 @@ class RoundRobinViewSampler:
 
 
 class OptimizableGaussianState(nn.Module):
-    def __init__(self, gs: GaussianModel, knn_k: int = 6, knn_max_points: int = 30000) -> None:
+    def __init__(self, gs: GaussianModel, query_points: torch.Tensor, knn_k: int = 6, knn_max_points: int = 30000) -> None:
         super().__init__()
-        self.xyz = nn.Parameter(gs.xyz.detach().clone())
-        self.offset = nn.Parameter(gs.offset.detach().clone())
+        initial_xyz = gs.xyz.detach().clone()
+        cano_points = query_points[0].detach().clone()
+        bound_mode = initial_xyz.shape == cano_points.shape
+        if bound_mode:
+            base_offset = initial_xyz - cano_points
+            anchor_offset = base_offset
+            xyz_delta = torch.zeros_like(initial_xyz)
+        else:
+            print(
+                "[multiview-refine] warning: initial Gaussian xyz shape does not match FLAME query points; "
+                "falling back to baked xyz geometry mode."
+            )
+            base_offset = gs.offset.detach().clone()
+            anchor_offset = base_offset
+            xyz_delta = torch.zeros_like(initial_xyz)
+        self.register_buffer("base_cano", cano_points if bound_mode else torch.zeros_like(initial_xyz))
+        self.register_buffer("base_offset", base_offset)
+        self.register_buffer("anchor_xyz", initial_xyz)
+        self.register_buffer("anchor_offset", anchor_offset)
+        self.register_buffer("bound_mode", torch.tensor(bound_mode, dtype=torch.bool))
+        self.xyz_delta = nn.Parameter(xyz_delta)
+        self.offset_delta = nn.Parameter(torch.zeros_like(base_offset))
         self.shs = nn.Parameter(gs.shs.detach().clone())
         self.opacity_logit = nn.Parameter(_inverse_sigmoid(gs.opacity.detach().clone().clamp(1e-4, 1.0 - 1e-4)))
         self.log_scaling = nn.Parameter(gs.scaling.detach().clone().clamp_min(1e-8).log())
         self.rotation = nn.Parameter(gs.rotation.detach().clone())
-        self.register_buffer("anchor_xyz", gs.xyz.detach().clone())
-        self.register_buffer("anchor_offset", gs.offset.detach().clone())
         self.register_buffer("anchor_scaling", gs.scaling.detach().clone())
-        src, dst, dist = _build_knn_edges(gs.xyz.detach(), knn_k, knn_max_points)
+        src, dst, dist = _build_knn_edges(initial_xyz, knn_k, knn_max_points)
         self.register_buffer("knn_src", src)
         self.register_buffer("knn_dst", dst)
         self.register_buffer("knn_dist", dist)
@@ -345,13 +407,23 @@ class OptimizableGaussianState(nn.Module):
     def scaling(self) -> torch.Tensor:
         return torch.exp(self.log_scaling)
 
+    @property
+    def xyz(self) -> torch.Tensor:
+        if bool(self.bound_mode.item()):
+            return self.base_cano + self.base_offset + self.offset_delta
+        return self.anchor_xyz + self.xyz_delta
+
+    @property
+    def offset(self) -> torch.Tensor:
+        return self.base_offset + self.offset_delta
+
     def set_trainable(self, appearance: bool, light_geometry: bool, xyz_geometry: bool) -> None:
         self.shs.requires_grad_(appearance)
         self.opacity_logit.requires_grad_(appearance)
         self.log_scaling.requires_grad_(light_geometry)
         self.rotation.requires_grad_(light_geometry)
-        self.xyz.requires_grad_(xyz_geometry)
-        self.offset.requires_grad_(light_geometry or xyz_geometry)
+        self.offset_delta.requires_grad_(light_geometry or xyz_geometry)
+        self.xyz_delta.requires_grad_(xyz_geometry and not bool(self.bound_mode.item()))
 
     def knn_anchor_loss(self) -> torch.Tensor:
         if self.knn_src.numel() == 0:
@@ -372,6 +444,15 @@ class OptimizableGaussianState(nn.Module):
             scaling=self.scaling,
             rotation=F.normalize(self.rotation, dim=-1),
         )
+
+    def geometry_delta_state_dict(self) -> dict:
+        return {
+            "bound_mode": bool(self.bound_mode.item()),
+            "base_offset": self.base_offset.detach().cpu(),
+            "offset_delta": self.offset_delta.detach().cpu(),
+            "xyz_delta": self.xyz_delta.detach().cpu(),
+            "effective_xyz": self.xyz.detach().cpu(),
+        }
 
 
 class OptimizableCameraState(nn.Module):
@@ -573,10 +654,19 @@ def compute_losses(
     }
 
 
-def _add_group(groups: list, params: list[torch.nn.Parameter], lr: float) -> None:
+def _grad_norm(params: list[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for param in params:
+        if param.grad is None:
+            continue
+        total += float(param.grad.detach().float().square().sum().cpu())
+    return math.sqrt(total)
+
+
+def _add_group(groups: list, params: list[torch.nn.Parameter], lr: float, decay_ratio: float = 0.5) -> None:
     active = [p for p in params if p.requires_grad]
     if active:
-        groups.append({"params": active, "lr": lr})
+        groups.append({"params": active, "lr": lr, "_decay_ratio": decay_ratio})
 
 
 def _scale_batch(batch: MultiViewBatch, scale: float) -> MultiViewBatch:
@@ -663,17 +753,17 @@ def _landmarks_are_pixels(landmarks: torch.Tensor) -> bool:
 
 
 def _masked_ssim_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    pred = pred * mask
-    target = target * mask
     c1 = 0.01 ** 2
     c2 = 0.03 ** 2
-    mu_x = F.avg_pool2d(pred.flatten(0, 1), 3, 1, 1)
-    mu_y = F.avg_pool2d(target.flatten(0, 1), 3, 1, 1)
-    sigma_x = F.avg_pool2d(pred.flatten(0, 1) ** 2, 3, 1, 1) - mu_x ** 2
-    sigma_y = F.avg_pool2d(target.flatten(0, 1) ** 2, 3, 1, 1) - mu_y ** 2
-    sigma_xy = F.avg_pool2d(pred.flatten(0, 1) * target.flatten(0, 1), 3, 1, 1) - mu_x * mu_y
+    p = pred.flatten(0, 1)
+    t = target.flatten(0, 1)
+    mu_x = F.avg_pool2d(p, 3, 1, 1)
+    mu_y = F.avg_pool2d(t, 3, 1, 1)
+    sigma_x = F.avg_pool2d(p ** 2, 3, 1, 1) - mu_x ** 2
+    sigma_y = F.avg_pool2d(t ** 2, 3, 1, 1) - mu_y ** 2
+    sigma_xy = F.avg_pool2d(p * t, 3, 1, 1) - mu_x * mu_y
     ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / ((mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)).clamp_min(1e-6)
-    weight = mask.flatten(0, 1).expand_as(ssim)
+    weight = F.avg_pool2d(mask.flatten(0, 1), 3, 1, 1)
     return ((1.0 - ssim.clamp(-1, 1)) * weight).sum() / weight.sum().clamp_min(1.0)
 
 
@@ -688,8 +778,10 @@ def _soft_iou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def _boundary_mask_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred = pred.clamp(0, 1)
     target = target.clamp(0, 1)
-    dilated = F.max_pool2d(target.flatten(0, 1), 5, 1, 2)
-    eroded = -F.max_pool2d(-target.flatten(0, 1), 5, 1, 2)
+    h, w = target.shape[-2:]
+    k = max(3, min(11, min(h, w) // 64))
+    dilated = F.max_pool2d(target.flatten(0, 1), k, 1, k // 2)
+    eroded = -F.max_pool2d(-target.flatten(0, 1), k, 1, k // 2)
     boundary = (dilated - eroded).reshape_as(target)
     return ((pred - target).abs() * boundary).sum() / boundary.sum().clamp_min(1.0)
 
@@ -732,7 +824,3 @@ def _inverse_sigmoid(value: torch.Tensor) -> torch.Tensor:
     return torch.log(value / (1.0 - value))
 
 
-def _config_to_json(config: RefinementConfig) -> dict:
-    raw = asdict(config)
-    raw["dtype"] = str(config.dtype)
-    return raw

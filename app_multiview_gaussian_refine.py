@@ -6,8 +6,8 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file
 
 from lam.models import ModelLAM
-from lam.multiview_refine.optimization import RefinementConfig, RefinementStageConfig
-from lam.multiview_refine.pipeline import MultiViewRefinePipeline
+from multiview_refine.optimization import RefinementConfig
+from multiview_refine.pipeline import MultiViewRefinePipeline
 
 
 def build_lam(config_path: str, model_name: str):
@@ -85,7 +85,9 @@ def import_colmap(workspace, sparse_dir, colmap_path):
 
 
 def align_sim3(workspace, flame_target_transforms):
-    result = _pipe(workspace).align_sim3(flame_target_transforms or None)
+    if not flame_target_transforms:
+        raise gr.Error("Provide calibrated target transforms. FLAME single-image tracking does not produce camera targets.")
+    result = _pipe(workspace).align_sim3(flame_target_transforms)
     return result.path, result.message, _image(result.path)
 
 
@@ -102,61 +104,12 @@ def preview(workspace, infer_config, model_name, init_ply):
 
 
 def _stage_config(stage, steps, lr, views_per_step, output_dir):
+    from dataclasses import replace
+
     if stage == "all":
-        config = RefinementConfig(output_dir=output_dir)
-        return config
-    stage_cfg = {
-        "calibrate": RefinementStageConfig(
-            "calibrate",
-            steps=steps,
-            lr=lr,
-            views_per_step=views_per_step,
-            resolution_scale=0.5,
-            optimize_global_sim3=True,
-            optimize_per_view_camera=True,
-            optimize_intrinsics=True,
-            use_ssim=True,
-            use_landmark=True,
-        ),
-        "pose": RefinementStageConfig(
-            "pose",
-            steps=steps,
-            lr=lr,
-            views_per_step=views_per_step,
-            resolution_scale=0.5,
-            optimize_expression=True,
-            use_ssim=False,
-            use_landmark=True,
-        ),
-        "appearance": RefinementStageConfig(
-            "appearance",
-            steps=steps,
-            lr=lr,
-            views_per_step=views_per_step,
-            optimize_appearance=True,
-            optimize_exposure=True,
-            use_ssim=True,
-        ),
-        "geometry_light": RefinementStageConfig(
-            "geometry_light",
-            steps=steps,
-            lr=lr,
-            views_per_step=views_per_step,
-            optimize_appearance=True,
-            optimize_geometry=True,
-            use_ssim=True,
-            use_knn_anchor=True,
-        ),
-        "geometry_xyz": RefinementStageConfig(
-            "geometry_xyz",
-            steps=steps,
-            lr=lr,
-            views_per_step=views_per_step,
-            optimize_geometry=True,
-            use_ssim=True,
-            use_knn_anchor=True,
-        ),
-    }[stage]
+        return RefinementConfig(output_dir=output_dir)
+    default_stages = {s.name: s for s in RefinementConfig().stages}
+    stage_cfg = replace(default_stages[stage], steps=steps, lr=lr, views_per_step=views_per_step)
     return RefinementConfig(stages=[stage_cfg], output_dir=output_dir)
 
 
@@ -217,7 +170,7 @@ def launch():
             import_colmap_btn.click(import_colmap, [workspace, sparse_dir, colmap_path], [output_path, status, colmap_plot])
 
         with gr.Tab("4. Sim3 Alignment"):
-            flame_target = gr.Textbox(label="FLAME Target Transforms (optional)")
+            flame_target = gr.Textbox(label="Calibrated Target Transforms")
             align_btn = gr.Button("Estimate Sim3 Alignment", variant="primary")
             sim3_plot = gr.Image(label="Sim3 Camera Alignment", type="filepath", height=480)
             align_btn.click(align_sim3, [workspace, flame_target], [output_path, status, sim3_plot])

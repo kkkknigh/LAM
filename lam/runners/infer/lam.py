@@ -381,6 +381,13 @@ class LAMInferrer(Inferrer):
             cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_gs_offset.ply")
             res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=False, offset2xyz=True)
             # res['cano_gs_lst'][0].save_ply("tmp.ply", rgb2sh=False, offset2xyz=True)
+            cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_canonical.ply")
+            res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=False, offset2xyz=False)
+            np.savez(
+                os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_canonical_flame_param.npz"),
+                shape=shape_param.detach().cpu().numpy(),
+                betas=shape_param.detach().cpu().numpy(),
+            )
 
             def save_color_points(points, colors, sv_pth, sv_fd="debug_vis/dataloader/"):
                 points = points.squeeze().detach().cpu().numpy()

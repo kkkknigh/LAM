@@ -32,6 +32,10 @@ class ColmapCamera:
             return fx, fy, cx, cy
         raise ValueError(f"Unsupported COLMAP camera model: {self.model}")
 
+    @property
+    def has_distortion(self) -> bool:
+        return self.model not in {"SIMPLE_PINHOLE", "PINHOLE"}
+
 
 @dataclass
 class ColmapImage:
@@ -89,6 +93,9 @@ def import_colmap_sparse(sparse_dir: str | Path, out_json: str | Path, colmap_pa
             "fl_y": fy,
             "cx": cx,
             "cy": cy,
+            "camera_model": cam.model,
+            "camera_params": cam.params,
+            "requires_undistorted": cam.has_distortion,
             "camera_angle_x": math.atan(cam.width / (fx * 2)) * 2,
             "camera_angle_y": math.atan(cam.height / (fy * 2)) * 2,
             "transform_matrix": image.c2w.tolist(),

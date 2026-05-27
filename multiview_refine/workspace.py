@@ -86,7 +86,12 @@ def import_local_inputs(
     if mask_dir:
         _copy_dir(Path(mask_dir), workspace.root / "fg_masks")
     if flame_dir:
-        _copy_dir(Path(flame_dir), workspace.flame_dir)
+        flame_dir = Path(flame_dir)
+        source_flame_param = flame_dir / "flame_param" if (flame_dir / "flame_param").is_dir() else flame_dir
+        _copy_dir(source_flame_param, workspace.flame_dir)
+        canonical = flame_dir / "canonical_flame_param.npz"
+        if canonical.exists():
+            shutil.copy2(canonical, workspace.root / "canonical_flame_param.npz")
     if colmap_dir:
         _copy_dir(Path(colmap_dir), workspace.colmap_dir)
     if init_ply:
