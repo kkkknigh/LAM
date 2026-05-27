@@ -207,16 +207,49 @@ def create_zip_archive(output_zip='runtime_/h5_render_data.zip', base_vid="nice"
         print(f"An error occurred: {e}")
 
 
+def expand_motion_seq_for_turntable(motion_seq, num_views=49, yaw_degrees=60):
+    c2ws = motion_seq["render_c2ws"]
+    device = c2ws.device
+    dtype = c2ws.dtype
+    angles = torch.linspace(-yaw_degrees, yaw_degrees, num_views, device=device, dtype=dtype)
+    angles = angles * torch.pi / 180.0
+
+    rots = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(num_views, 1, 1)
+    cos, sin = torch.cos(angles), torch.sin(angles)
+    rots[:, 0, 0] = cos
+    rots[:, 0, 2] = sin
+    rots[:, 2, 0] = -sin
+    rots[:, 2, 2] = cos
+
+    base_c2w = c2ws[:, :1].clone()
+    turntable_c2ws = base_c2w.repeat(1, num_views, 1, 1)
+    turntable_c2ws[0] = torch.matmul(rots, base_c2w[0, 0])
+    motion_seq["render_c2ws"] = turntable_c2ws
+    motion_seq["render_intrs"] = motion_seq["render_intrs"][:, :1].repeat(1, num_views, 1, 1)
+    motion_seq["render_bg_colors"] = motion_seq["render_bg_colors"][:, :1].repeat(1, num_views, 1)
+
+    for key, value in list(motion_seq["flame_params"].items()):
+        if key != "betas" and value.ndim >= 3 and value.shape[1] == 1:
+            motion_seq["flame_params"][key] = value.repeat(1, num_views, *([1] * (value.ndim - 2)))
+    return motion_seq
+
+
 def demo_lam(flametracking, lam, cfg):
 
     # @spaces.GPU(duration=80)
     def core_fn(image_path: str, video_params, working_dir, enable_oac_file):
+        if isinstance(video_params, dict):
+            video_params = video_params.get("name") or video_params.get("path")
+
         image_raw = os.path.join(working_dir.name, "raw.png")
         with Image.open(image_path).convert('RGB') as img:
             img.save(image_raw)
-        
-        base_vid = os.path.basename(video_params).split(".")[0]
-        flame_params_dir = os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
+
+        base_vid = os.path.basename(video_params).split(".")[0] if video_params else None
+        sample_motion_dir = (
+            os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
+            if base_vid else None
+        )
         base_iid = os.path.basename(image_path).split('.')[0]
         image_path = os.path.join("./assets/sample_input", base_iid, "images/00000_00.png")
 
@@ -233,12 +266,10 @@ def demo_lam(flametracking, lam, cfg):
         )
         print("subdir_path and uid:", subdir_path, uid)
 
-        motion_seqs_dir = flame_params_dir
-
         dump_image_dir = os.path.dirname(dump_image_path)
         os.makedirs(dump_image_dir, exist_ok=True)
 
-        print(image_raw, motion_seqs_dir, dump_image_dir, dump_video_path)
+        print(image_raw, sample_motion_dir, dump_image_dir, dump_video_path)
 
         dump_tmp_dir = dump_image_dir
 
@@ -274,18 +305,25 @@ def demo_lam(flametracking, lam, cfg):
         vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
         Image.fromarray(vis_ref_img).save(save_ref_img_path)
 
-        # prepare motion seq
+        # prepare motion seq. If no driving video is selected, use the single image
+        # tracking result so the app can run as image-only reconstruction.
+        motion_seqs_dir = sample_motion_dir or os.path.join(output_dir, "flame_param")
+        if not os.path.isdir(motion_seqs_dir):
+            raise gr.Error(f"Motion parameters not found: {motion_seqs_dir}")
+
         src = Path(image_path).parent.parent.name
         driven = Path(motion_seqs_dir).parent.name
         src_driven = [src, driven]
         motion_seq = prepare_motion_seqs(motion_seqs_dir, None, save_root=dump_tmp_dir, fps=render_fps,
-                                            bg_color=1., aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
+                                            bg_color=1., aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
                                             render_image_res=render_size,  multiply=16, 
                                             need_mask=motion_img_need_mask, vis_motion=vis_motion, 
                                             shape_param=shape_param, test_sample=False, cross_id=False, src_driven=src_driven)
 
         # start inference
         motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
+        if base_vid is None:
+            motion_seq = expand_motion_seq_for_turntable(motion_seq)
         device, dtype = "cuda", torch.float32
         print("start to inference...................")
         with torch.no_grad():
@@ -303,12 +341,12 @@ def demo_lam(flametracking, lam, cfg):
             res['cano_gs_lst'][0].save_ply(os.path.join(h5_fd, "offset.ply"), rgb2sh=False, offset2xyz=True)
             cmd = "thirdparties/blender/blender --background --python 'tools/generateGLBWithBlender_v2.py'"
             os.system(cmd)
-            create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
+            if base_vid:
+                create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
 
         if enable_oac_file:
             try:
                 from tools.generateARKITGLBWithBlender import generate_glb
-                from pathlib import Path
                 import shutil
                 import patoolib
 
@@ -362,9 +400,12 @@ def demo_lam(flametracking, lam, cfg):
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
 
         save_images2video(rgb, dump_video_path, render_fps)
-        audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
-        dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-        add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
+        dump_video_path_wa = dump_video_path
+        if base_vid:
+            audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
+            if os.path.exists(audio_path):
+                dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
+                add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
 
         return dump_image_path, dump_video_path_wa, output_zip_path if enable_oac_file else ''
 
@@ -496,7 +537,7 @@ def demo_lam(flametracking, lam, cfg):
         )
 
         demo.queue()
-        demo.launch()
+        demo.launch(server_name="127.0.0.1", server_port=7860)
 
 
 def _build_model(cfg):
@@ -534,6 +575,8 @@ def launch_gradio_app():
         'APP_INFER': './configs/inference/lam-20k-8gpu.yaml',
         'APP_TYPE': 'infer.lam',
         'NUMBA_THREADING_LAYER': 'omp',
+        'NO_PROXY': 'localhost,127.0.0.1,::1',
+        'no_proxy': 'localhost,127.0.0.1,::1',
     })
 
     cfg, _ = parse_configs()
