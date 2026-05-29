@@ -84,7 +84,7 @@ def import_masks(workspace, mask_dir):
     if not mask_dir:
         raise gr.Error("Provide a mask directory.")
     result = _pipe(workspace).import_and_process_masks(mask_dir)
-    return result.path, f"{result.message}\nNext: preview masks, then run Calibrate/Camera.", _gallery(result.path)
+    return result.path, f"{result.message}\nNext: run COLMAP.", _gallery(result.path)
 
 
 def restore_uploaded_masks(workspace):
@@ -94,14 +94,14 @@ def restore_uploaded_masks(workspace):
 
 def run_colmap(workspace):
     result = _pipe(workspace).run_colmap(DEFAULT_COLMAP_PATH)
-    return result.path, f"{result.message}\nNext: initialize Sim3.", _image(result.path)
+    return result.path, f"{result.message}\nNext: initialize alignment.", _image(result.path)
 
 
 def initialize_sim3(workspace):
     lam = build_lam()
     result = _pipe(workspace).initialize_sim3_from_layer1(lam)
     score = _projection_score_text(Path(workspace))
-    return result.path, f"{result.message}\n{score}\nNext: preview alignment, then run Calibrate if the overlay is not tight.", _image(result.path)
+    return result.path, f"{result.message}\n{score}\nNext: preview alignment, then calibrate alignment if the overlay is not tight.", _image(result.path)
 
 
 def preview(workspace):
@@ -109,7 +109,20 @@ def preview(workspace):
     result = _pipe(workspace).preview_alignment(lam, None)
     gallery = sorted(Path(result.path).glob("*.png"))
     status = _alignment_status_text(Path(workspace))
-    return result.path, f"{result.message}\n{status}\nNext: run Calibrate before refinement if face position/scale is still offset.", [str(p) for p in gallery]
+    return result.path, f"{result.message}\n{status}\nNext: calibrate alignment before refinement if face position/scale is still offset.", [str(p) for p in gallery]
+
+
+def calibrate_alignment(workspace):
+    if not workspace:
+        raise gr.Error("Create or select a workspace first.")
+    lam = build_lam()
+    result = _pipe(workspace).calibrate_global_sim3_blackbox(lam)
+    return (
+        result.path,
+        f"{result.message}\nNext: preview alignment, then run refinement.",
+        _image(result.path),
+        [],
+    )
 
 
 def refine_calibrate(workspace):
@@ -156,11 +169,30 @@ def refine_geometry(workspace):
     return _refine_stages(workspace, ["geometry_light"], resume_required=False, next_step="export the package.")
 
 
-def _refine_stages(workspace, stage_names, resume_required, next_step, resume_from_latest=True):
+def refine_small_xyz_geometry(workspace):
+    defaults = {stage.name: stage for stage in RefinementConfig().stages}
+    stage = replace(defaults["geometry_xyz"])
+    loss_weights = replace(RefinementConfig().loss_weights, xyz_anchor=0.01, knn_anchor=0.004, scale_limit=0.002)
+    return _refine_stages(
+        workspace,
+        ["geometry_xyz"],
+        resume_required=False,
+        next_step="render final review or export the package.",
+        resume_from_latest=True,
+        stages=[stage],
+        loss_weights=loss_weights,
+    )
+
+
+def _refine_stages(workspace, stage_names, resume_required, next_step, resume_from_latest=True, stages=None, loss_weights=None):
     lam = build_lam()
-    default_stages = {stage.name: stage for stage in RefinementConfig().stages}
-    stages = [replace(default_stages[name]) for name in stage_names]
+    if stages is None:
+        default_stages = {stage.name: stage for stage in RefinementConfig().stages}
+        stages = [replace(default_stages[name]) for name in stage_names]
+    stages = [_app_stage(stage) for stage in stages]
     config = RefinementConfig(stages=stages, output_dir=str(Path(workspace) / "refine"))
+    if loss_weights is not None:
+        config.loss_weights = loss_weights
     resume = None
     latest = Path(workspace) / "refine" / "checkpoints" / "latest.pt"
     if resume_from_latest and latest.exists():
@@ -181,9 +213,24 @@ def _refine_stages(workspace, stage_names, resume_required, next_step, resume_fr
     )
 
 
+def _app_stage(stage):
+    return stage
+
+
 def export(workspace):
     result = _pipe(workspace).export()
     return result.path, result.message
+
+
+def render_final_review(workspace):
+    if not workspace:
+        raise gr.Error("Create or select a workspace first.")
+    lam = build_lam()
+    result = _pipe(workspace).export_final_review(lam)
+    review_dir = Path(result.path)
+    overlays = sorted((review_dir / "overlays").glob("*.png"))
+    video = review_dir / "final_review.mp4"
+    return result.path, result.message, [str(p) for p in overlays], str(video) if video.exists() else None
 
 
 def workspace_status(workspace):
@@ -210,6 +257,8 @@ def workspace_status(workspace):
         f"transforms_aligned.json: {(root / 'alignment' / 'transforms_aligned.json').exists()}",
         f"refined_gaussian.ply: {(root / 'refine' / 'refined_gaussian.ply').exists()}",
         f"export package: {(root / 'exports' / 'package.zip').exists()}",
+        f"final review: {(root / 'exports' / 'final_review.zip').exists()}",
+        f"final review video: {(root / 'exports' / 'final_review' / 'final_review.mp4').exists()}",
     ]
     return "\n".join(lines)
 
@@ -234,7 +283,7 @@ def _alignment_status_text(workspace: Path) -> str:
     calibrated = workspace / "alignment" / "landmark_calibration_report.json"
     if calibrated.exists():
         return "Alignment status: landmark calibrated. Use this preview for refinement decisions."
-    return "Alignment status: initial Sim3 only. This is coarse; Run Calibrate is expected before refinement when overlay is offset."
+    return "Alignment status: initial Sim3 only. This is coarse; Calibrate Alignment is expected before refinement when overlay is offset."
 
 
 def launch():
@@ -259,7 +308,7 @@ def launch():
             [workspace, workspace_display, status, workspace_gallery],
         )
 
-        gr.Markdown("## 2. FLAME Tracking / Masks")
+        gr.Markdown("## 2. Masks / FLAME")
         flame_btn = gr.Button("Run FLAME Tracking (Keep Uploaded Masks)", variant="primary")
         mask_dir = gr.Textbox(label="External Mask Dir (SAM/rembg/etc.)", placeholder="Path containing fg_masks/, masks/, or same-stem PNG masks")
         import_masks_btn = gr.Button("Import / Postprocess Masks")
@@ -274,41 +323,41 @@ def launch():
         colmap_plot = gr.Image(label="COLMAP Camera Centers", type="filepath", height=480)
         colmap_btn.click(run_colmap, [workspace], [output_path, status, colmap_plot])
 
-        gr.Markdown("## 4. Sim3 Alignment")
-        init_sim3_btn = gr.Button("Initialize Sim3", variant="primary")
-        sim3_plot = gr.Image(label="Sim3 Camera Alignment", type="filepath", height=480)
-        init_sim3_btn.click(initialize_sim3, [workspace], [output_path, status, sim3_plot])
-
-        gr.Markdown("## 5. Preview")
-        preview_btn = gr.Button("Preview Alignment", variant="primary")
-        preview_gallery = gr.Gallery(label="Alignment Overlays", columns=2, height=480)
-        preview_btn.click(preview, [workspace], [output_path, status, preview_gallery])
-
-        gr.Markdown("## 6. Refinement")
+        gr.Markdown("## 4. Camera Alignment / Calibration")
         with gr.Row():
-            calibrate_btn = gr.Button("Run Calibrate", variant="primary")
-            camera_btn = gr.Button("Run Camera")
-            reuse_btn = gr.Button("Reuse COLMAP+FLAME: Camera + Pose + Appearance")
-            pose_btn = gr.Button("Run Pose")
-            appearance_btn = gr.Button("Run Appearance")
+            init_sim3_btn = gr.Button("Initialize Alignment", variant="primary")
+            preview_btn = gr.Button("Preview Alignment")
+            calibrate_btn = gr.Button("Calibrate Alignment")
+        alignment_plot = gr.Image(label="Camera Alignment", type="filepath", height=420)
+        alignment_gallery = gr.Gallery(label="Alignment Overlays", columns=2, height=480)
+        init_sim3_btn.click(initialize_sim3, [workspace], [output_path, status, alignment_plot])
+        preview_btn.click(preview, [workspace], [output_path, status, alignment_gallery])
+        calibrate_btn.click(calibrate_alignment, [workspace], [output_path, status, alignment_plot, alignment_gallery])
+
+        gr.Markdown("## 5. Refinement")
+        with gr.Row():
+            refine_btn = gr.Button("Run Refine", variant="primary")
             geometry_btn = gr.Button("Run Geometry")
+            small_xyz_btn = gr.Button("Run Small XYZ Geometry (Optional / Advanced)")
         refine_gallery = gr.Gallery(label="Latest Refinement Overlay", columns=2, height=480)
         loss_plot = gr.Image(label="Loss History", type="filepath", height=360)
-        calibrate_btn.click(refine_calibrate, [workspace], [output_path, status, refine_gallery, loss_plot])
-        camera_btn.click(refine_camera, [workspace], [output_path, status, refine_gallery, loss_plot])
-        reuse_btn.click(refine_alignment_pose_appearance, [workspace], [output_path, status, refine_gallery, loss_plot])
-        pose_btn.click(refine_pose, [workspace], [output_path, status, refine_gallery, loss_plot])
-        appearance_btn.click(refine_appearance, [workspace], [output_path, status, refine_gallery, loss_plot])
+        refine_btn.click(refine_alignment_pose_appearance, [workspace], [output_path, status, refine_gallery, loss_plot])
         geometry_btn.click(refine_geometry, [workspace], [output_path, status, refine_gallery, loss_plot])
+        small_xyz_btn.click(refine_small_xyz_geometry, [workspace], [output_path, status, refine_gallery, loss_plot])
 
-        gr.Markdown("## 7. Export")
-        export_btn = gr.Button("Export Final Package", variant="primary")
+        gr.Markdown("## 6. Export / Final Review")
+        with gr.Row():
+            export_btn = gr.Button("Export Package", variant="primary")
+            review_btn = gr.Button("Render Final Review")
+        review_gallery = gr.Gallery(label="Final Review Overlays", columns=2, height=480)
+        review_video = gr.Video(label="Final Review Video", format="mp4", height=360)
         export_btn.click(export, [workspace], [output_path, status])
+        review_btn.click(render_final_review, [workspace], [output_path, status, review_gallery, review_video])
         refresh_btn.click(workspace_status, [workspace], [status])
 
-        demo.queue()
+        demo.queue(concurrency_count=1, max_size=2)
         port = int(os.environ.get("GRADIO_SERVER_PORT", "7861"))
-        demo.launch(server_name="127.0.0.1", server_port=port)
+        demo.launch(server_name="127.0.0.1", server_port=port, max_threads=1)
 
 
 if __name__ == "__main__":

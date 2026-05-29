@@ -108,7 +108,7 @@ class RefinementConfig:
         ),
         RefinementStageConfig(
             "appearance",
-            steps=300,
+            steps=400,
             lr=8e-4,
             resolution_scale=0.5,
             optimize_appearance=True,
@@ -118,8 +118,8 @@ class RefinementConfig:
         ),
         RefinementStageConfig(
             "geometry_light",
-            steps=100,
-            lr=2e-4,
+            steps=200,
+            lr=1e-4,
             resolution_scale=0.5,
             optimize_appearance=False,
             optimize_opacity=False,
@@ -130,9 +130,11 @@ class RefinementConfig:
         RefinementStageConfig(
             "geometry_xyz",
             steps=100,
-            lr=5e-4,
+            lr=2e-4,
+            resolution_scale=0.5,
             optimize_geometry=True,
-            use_ssim=True,
+            use_ssim=False,
+            use_landmark=True,
             use_knn_anchor=True,
         ),
     ])
