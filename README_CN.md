@@ -4,10 +4,10 @@
 <strong><a href="README.md">English</a> | 中文</strong>
 </p>
 
-[![Website](https://raw.githubusercontent.com/prs-eth/Marigold/main/doc/badges/badge-website.svg)](https://aigc3d.github.io/projects/LAM/) 
-[![arXiv Paper](https://img.shields.io/badge/📜-arXiv:2503-10625)](https://arxiv.org/pdf/2502.17796)
-[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace_Space-blue)](https://huggingface.co/spaces/3DAIGC/LAM)
-[![ModelScope](https://img.shields.io/badge/🧱-ModelScope_Space-blue)](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) 
+[![Website](https://img.shields.io/badge/🏠-Website-blue)](https://aigc3d.github.io/projects/LAM/) 
+[![arXiv Paper](https://img.shields.io/badge/📜-arXiv:2502--17796-green)](https://arxiv.org/pdf/2502.17796)
+[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-blue)](https://huggingface.co/spaces/3DAIGC/LAM)
+[![ModelScope](https://img.shields.io/badge/🧱-ModelScope-blue)](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) 
 [![Apache License](https://img.shields.io/badge/📃-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
 
 <p align="center">
@@ -40,6 +40,10 @@
 
 ## 📢 最新动态
 
+**[2025年5月20日]** 我们发布了 [WebGL渲染器](https://github.com/aigc3d/LAM_WebRender)！
+
+**[2025年5月10日]** 我们的 [ModelScope](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) 演示程序现已支持将生成的数字人直接导出成OpenAvatarChat需要的文件，进行实时对话！
+
 **[2025年4月30日]** 我们开源了 [Avatar 导出功能](tools/AVATAR_EXPORT_GUIDE.md)，允许用户在 OpenAvatarChat 平台上接入任何由 LAM 生成的 3D 数字人进行实时对话！🔥 <br>
 
 **[2025年4月21日]** 我们开源了 WebGL交互数字人SDK：[OpenAvatarChat](https://github.com/HumanAIGC-Engineering/OpenAvatarChat) (including LLM, ASR, TTS, Avatar), 使用这个SDK可以自由地与我们的LAM-3D数字人进行实时对话 ! 🔥 <br>
@@ -53,7 +57,7 @@
 - [x] 部署Huggingface演示程序.
 - [x] 部署Modelscope演示程序.
 - [ ] 开源在自有大数据集上训练的LAM-large模型.
-- [ ] 开源跨平台WebGL驱动渲染引擎.
+- [x] 开源跨平台WebGL驱动渲染引擎.
 - [x] 开源语音驱动模型: Audio2Expression.
 - [x] 开源交互对话数字人SDK，包括LLM, ASR, TTS, Avatar.
 

@@ -4,10 +4,10 @@
 <strong>English | <a href="README_CN.md">中文</a></strong>
 </p>
 
-[![Website](https://raw.githubusercontent.com/prs-eth/Marigold/main/doc/badges/badge-website.svg)](https://aigc3d.github.io/projects/LAM/) 
-[![arXiv Paper](https://img.shields.io/badge/📜-arXiv:2503-10625)](https://arxiv.org/pdf/2502.17796)
-[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace_Space-blue)](https://huggingface.co/spaces/3DAIGC/LAM)
-[![ModelScope](https://img.shields.io/badge/🧱-ModelScope_Space-blue)](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) 
+[![Website](https://img.shields.io/badge/🏠-Website-blue)](https://aigc3d.github.io/projects/LAM/) 
+[![arXiv Paper](https://img.shields.io/badge/📜-arXiv:2502--17796-green)](https://arxiv.org/pdf/2502.17796)
+[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-blue)](https://huggingface.co/spaces/3DAIGC/LAM)
+[![ModelScope](https://img.shields.io/badge/🧱-ModelScope-blue)](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) 
 [![Apache License](https://img.shields.io/badge/📃-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
 
 <p align="center">
@@ -40,6 +40,13 @@
 </div>
 
 ## 📢 News
+**[April 30, 2026]** We have released the technical report and project page of [MeshLAM](https://arxiv.org/abs/2604.22865v1), CVPR 2026!
+
+**[September 9, 2025]** We have released the technical report of [PanoLAM](https://arxiv.org/pdf/2509.07552)!
+
+**[May 20, 2025]** We have released the [WebGL-Render](https://github.com/aigc3d/LAM_WebRender)!
+
+**[May 10, 2025]** The [ModelScope](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) Demo now supports directly exporting the generated Avatar to files required by OpenAvatarChat for interactive chatting!
 
 **[April 30, 2025]** We have released a [Avatar Export Feature](tools/AVATAR_EXPORT_GUIDE.md) that allows users to chat with any LAM-generated 3D digital humans on OpenAvatarChat. 🔥 <br>
 
@@ -47,14 +54,14 @@
 
 **[April 19, 2025]** We have released the [Audio2Expression](https://github.com/aigc3d/LAM_Audio2Expression) model, which can animate the generated LAM Avatar with audio input ! 🔥 <br>
 
-**[April 10, 2025]** We have released the demo on [ModelScope](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) Space ! <br>
+<!-- **[April 10, 2025]** We have released the demo on [ModelScope](https://www.modelscope.cn/studios/Damo_XR_Lab/LAM_Large_Avatar_Model) Space ! <br> -->
 
 ### To do list
 - [x] Release LAM-small trained on VFHQ and Nersemble.
 - [x] Release Huggingface space.
 - [x] Release Modelscope space.
 - [ ] Release LAM-large trained on a self-constructed large dataset.
-- [ ] Release WebGL Render for cross-platform animation and rendering.
+- [x] Release WebGL Render for cross-platform animation and rendering.
 - [x] Release audio driven model: Audio2Expression.
 - [x] Release Interactive Chatting Avatar SDK with [OpenAvatarChat](https://github.com/HumanAIGC-Engineering/OpenAvatarChat), including LLM, ASR, TTS, Avatar.
 
@@ -158,12 +165,11 @@ Welcome to follow our other interesting works:
 
 ### Citation
 ```
-@inproceedings{he2025LAM,
+@inproceedings{he2025lam,
   title={LAM: Large Avatar Model for One-shot Animatable Gaussian Head},
-  author={
-    Yisheng He and Xiaodong Gu and Xiaodan Ye and Chao Xu and Zhengyi Zhao and Yuan Dong and Weihao Yuan and Zilong Dong and Liefeng Bo
-  },
-  booktitle={SIGGRAPH},
+  author={He, Yisheng and Gu, Xiaodong and Ye, Xiaodan and Xu, Chao and Zhao, Zhengyi and Dong, Yuan and Yuan, Weihao and Dong, Zilong and Bo, Liefeng},
+  booktitle={Proceedings of the Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers},
+  pages={1--13},
   year={2025}
 }
 ```
