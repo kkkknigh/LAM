@@ -22,15 +22,17 @@ class LossWeights:
     mask: float = 0.2
     mask_iou: float = 0.1
     mask_boundary: float = 0.1
-    landmark: float = 0.02
+    landmark: float = 80.0
     sim3_reg: float = 0.01
     camera_delta_reg: float = 0.01
+    colmap_relative_reg: float = 0.05
     intrinsics_reg: float = 0.1
     exposure_reg: float = 0.01
     xyz_anchor: float = 0.001
     offset_anchor: float = 0.01
     scale_anchor: float = 0.001
     opacity_reg: float = 0.0001
+    appearance_anchor: float = 2.0
     expr_reg: float = 0.01
     jaw_reg: float = 0.05
     eyes_reg: float = 0.05
@@ -47,14 +49,24 @@ class RefinementStageConfig:
     optimize_global_sim3: bool = False
     optimize_per_view_camera: bool = False
     optimize_appearance: bool = False
+    optimize_opacity: bool = False
     optimize_geometry: bool = False
     optimize_expression: bool = False
     optimize_intrinsics: bool = False
     optimize_exposure: bool = False
     resolution_scale: float = 1.0
     use_ssim: bool = True
+    use_rgb_loss: bool = True
+    use_mask_loss: bool = True
     use_landmark: bool = False
+    use_colmap_relative_reg: bool = False
     use_knn_anchor: bool = False
+    appearance_delta_limit: float = 0.08
+    rgb_mask_mode: str = "render_target_intersection"
+    mask_quality_min_coverage: float = 0.02
+    mask_quality_max_coverage: float = 0.85
+    mask_quality_max_border_fraction: float = 0.55
+    landmark_beta: float = 0.002
     lr_decay_xyz: float = 0.2
     lr_decay_appearance: float = 0.5
     lr_decay_camera: float = 1.0
@@ -70,10 +82,20 @@ class RefinementConfig:
             lr=1e-3,
             resolution_scale=0.5,
             optimize_global_sim3=True,
-            optimize_per_view_camera=True,
-            optimize_intrinsics=True,
             use_ssim=True,
             use_landmark=True,
+        ),
+        RefinementStageConfig(
+            "camera",
+            steps=200,
+            lr=8e-4,
+            resolution_scale=0.5,
+            optimize_per_view_camera=True,
+            use_ssim=True,
+            use_rgb_loss=False,
+            use_mask_loss=True,
+            use_landmark=True,
+            use_colmap_relative_reg=True,
         ),
         RefinementStageConfig(
             "pose",
@@ -86,17 +108,21 @@ class RefinementConfig:
         ),
         RefinementStageConfig(
             "appearance",
-            steps=800,
-            lr=5e-3,
+            steps=300,
+            lr=8e-4,
+            resolution_scale=0.5,
             optimize_appearance=True,
-            optimize_exposure=True,
+            optimize_exposure=False,
+            optimize_opacity=False,
             use_ssim=True,
         ),
         RefinementStageConfig(
             "geometry_light",
-            steps=300,
-            lr=1e-3,
-            optimize_appearance=True,
+            steps=100,
+            lr=2e-4,
+            resolution_scale=0.5,
+            optimize_appearance=False,
+            optimize_opacity=False,
             optimize_geometry=True,
             use_ssim=True,
             use_knn_anchor=True,
@@ -126,6 +152,8 @@ class RefinementConfig:
 @dataclass
 class RenderContext:
     c2ws: torch.Tensor
+    base_c2ws: torch.Tensor
+    view_indices: Optional[torch.Tensor]
     intrs: torch.Tensor
     flame_params: TensorDict
     landmark_2d: Optional[torch.Tensor] = None
@@ -137,7 +165,7 @@ class MultiViewGaussianRefiner:
         self.config = config or RefinementConfig()
         self.output_dir = Path(self.config.output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
-        self.debug_dir = self.output_dir / "debug"
+        self.debug_dir = self.output_dir.parent / "debug" / "05_refine"
         self.best_metric = float("inf")
 
     def run(self, initial_gs: GaussianModel, batch: MultiViewBatch, resume: Optional[str | Path] = None) -> GaussianModel:
@@ -159,11 +187,24 @@ class MultiViewGaussianRefiner:
         sampler = RoundRobinViewSampler(batch.c2ws.shape[1], device=device)
         start_stage, start_step = 0, 0
         if resume:
-            start_stage, start_step = self._load_checkpoint(resume, gs_state, camera_state, intr_state, exposure_state, expr_state)
+            start_stage, start_step = self._load_checkpoint(
+                resume,
+                gs_state,
+                camera_state,
+                intr_state,
+                exposure_state,
+                expr_state,
+                [stage.name for stage in self.config.stages],
+            )
 
         for stage_idx, stage in enumerate(self.config.stages):
             if stage_idx < start_stage:
                 continue
+            if stage.name == "calibrate":
+                raise RuntimeError(
+                    "Gradient-based calibrate is disabled. Use MultiViewRefinePipeline.calibrate_global_sim3_blackbox() "
+                    "so global Sim3 is baked back into alignment/transforms_aligned.json."
+                )
             optimizer, scheduler = self._build_optimizer(gs_state, camera_state, intr_state, exposure_state, expr_state, stage)
             first_step = start_step if stage_idx == start_stage else 0
             sampler.reset()
@@ -194,7 +235,7 @@ class MultiViewGaussianRefiner:
                 metric = float(losses["total"].detach().cpu())
                 if metric < self.best_metric:
                     self.best_metric = metric
-                    self._save_checkpoint("best.pt", stage_idx, step + 1, gs_state, camera_state, intr_state, exposure_state, expr_state)
+                    self._save_checkpoint("best.pt", stage_idx, stage.name, step + 1, gs_state, camera_state, intr_state, exposure_state, expr_state)
 
                 if step == 0 or (step + 1) % self.config.log_every == 0 or step + 1 == stage.steps:
                     metrics = {k: float(v.detach().cpu()) for k, v in losses.items()}
@@ -202,7 +243,7 @@ class MultiViewGaussianRefiner:
                     print(f"[multiview-refine:{stage.name}] {step + 1}/{stage.steps} {metrics}")
                 if step == 0 or (step + 1) % self.config.debug_every == 0 or step + 1 == stage.steps:
                     self._save_debug(stage.name, step + 1, sub_batch, render)
-                    self._save_checkpoint("latest.pt", stage_idx, step + 1, gs_state, camera_state, intr_state, exposure_state, expr_state)
+                    self._save_checkpoint("latest.pt", stage_idx, stage.name, step + 1, gs_state, camera_state, intr_state, exposure_state, expr_state)
             start_step = 0
 
         refined = gs_state.to_gaussian_model()
@@ -244,11 +285,20 @@ class MultiViewGaussianRefiner:
         landmarks = None
         if stage.use_landmark and batch.landmarks_2d is not None:
             landmarks = _project_flame_landmarks(self.renderer, query_points, flame_params, c2ws, intrs, h, w)
-        return render, RenderContext(c2ws=c2ws, intrs=intrs, flame_params=flame_params, landmark_2d=landmarks)
+        return render, RenderContext(
+            c2ws=c2ws,
+            base_c2ws=batch.c2ws,
+            view_indices=batch.view_indices,
+            intrs=intrs,
+            flame_params=flame_params,
+            landmark_2d=landmarks,
+        )
 
     def _build_optimizer(self, gs_state, camera_state, intr_state, exposure_state, expr_state, stage):
+        gs_state.set_appearance_delta_limit(stage.appearance_delta_limit)
         gs_state.set_trainable(
             appearance=stage.optimize_appearance,
+            opacity=stage.optimize_opacity,
             light_geometry=stage.optimize_geometry and stage.name != "geometry_xyz",
             xyz_geometry=stage.name == "geometry_xyz",
         )
@@ -261,8 +311,9 @@ class MultiViewGaussianRefiner:
         _add_group(groups, [camera_state.per_view_axis_angle, camera_state.per_view_translation], stage.lr * 0.25, stage.lr_decay_camera)
         _add_group(groups, list(intr_state.parameters()), stage.lr * 0.1, stage.lr_decay_camera)
         _add_group(groups, list(exposure_state.parameters()), stage.lr, stage.lr_decay_appearance)
-        _add_group(groups, [gs_state.shs], stage.lr, stage.lr_decay_appearance)
-        _add_group(groups, [gs_state.opacity_logit, gs_state.log_scaling, gs_state.rotation], stage.lr * 0.25, stage.lr_decay_xyz)
+        _add_group(groups, [gs_state.shs_delta], stage.lr, stage.lr_decay_appearance)
+        _add_group(groups, [gs_state.opacity_logit], stage.lr * 0.25, stage.lr_decay_xyz)
+        _add_group(groups, [gs_state.log_scaling, gs_state.rotation], stage.lr * 0.25, stage.lr_decay_xyz)
         _add_group(groups, [gs_state.xyz_delta, gs_state.offset_delta], stage.lr * 0.05, stage.lr_decay_xyz)
         _add_group(groups, list(expr_state.parameters()), stage.lr * 0.5, stage.lr_decay_expression)
         if not groups:
@@ -279,7 +330,7 @@ class MultiViewGaussianRefiner:
         diagnostics = {
             "stage": stage,
             "step": step,
-            "shs": _grad_norm([gs_state.shs]),
+            "shs_delta": _grad_norm([gs_state.shs_delta]),
             "offset_delta": _grad_norm([gs_state.offset_delta]),
             "xyz_delta": _grad_norm([gs_state.xyz_delta]),
             "log_scaling": _grad_norm([gs_state.log_scaling]),
@@ -296,7 +347,7 @@ class MultiViewGaussianRefiner:
         if (diagnostics["camera_global"] + diagnostics["camera_per_view"] + diagnostics["intrinsics"]) <= 1e-12:
             print(
                 f"[multiview-refine:{stage}] warning: camera/intrinsics gradients are zero or unavailable; "
-                "use manual/explicit Sim3 alignment if calibration does not move."
+                "run Layer1 Sim3 initialization or explicit calibrated alignment if calibration does not move."
             )
 
     def _save_debug(self, stage: str, step: int, batch: MultiViewBatch, render: Dict[str, torch.Tensor]) -> None:
@@ -310,9 +361,10 @@ class MultiViewGaussianRefiner:
             batch.landmarks_2d.detach().cpu() if batch.landmarks_2d is not None else None,
         )
 
-    def _save_checkpoint(self, name: str, stage_idx: int, step: int, gs_state, camera_state, intr_state, exposure_state, expr_state) -> None:
+    def _save_checkpoint(self, name: str, stage_idx: int, stage_name: str, step: int, gs_state, camera_state, intr_state, exposure_state, expr_state) -> None:
         payload = {
             "stage_idx": stage_idx,
+            "stage_name": stage_name,
             "step": step,
             "best_metric": self.best_metric,
             "gaussian": gs_state.state_dict(),
@@ -323,9 +375,12 @@ class MultiViewGaussianRefiner:
         }
         torch.save(payload, self.checkpoint_dir / name)
 
-    def _load_checkpoint(self, path: str | Path, gs_state, camera_state, intr_state, exposure_state, expr_state) -> tuple[int, int]:
+    def _load_checkpoint(self, path: str | Path, gs_state, camera_state, intr_state, exposure_state, expr_state, stage_names: List[str]) -> tuple[int, int]:
         payload = torch.load(path, map_location="cpu")
-        gs_state.load_state_dict(payload["gaussian"], strict=False)
+        gaussian_payload = _filter_compatible_state_dict(gs_state, payload["gaussian"])
+        missing, unexpected = gs_state.load_state_dict(gaussian_payload, strict=False)
+        if missing or unexpected:
+            print(f"[multiview-refine] checkpoint gaussian compatibility: missing={list(missing)}, unexpected={list(unexpected)}")
         camera_state.load_state_dict(payload["camera"], strict=False)
         if "intrinsics" in payload:
             intr_state.load_state_dict(payload["intrinsics"], strict=False)
@@ -334,6 +389,11 @@ class MultiViewGaussianRefiner:
         if "expression" in payload:
             expr_state.load_state_dict(payload["expression"], strict=False)
         self.best_metric = float(payload.get("best_metric", float("inf")))
+        saved_stage_name = payload.get("stage_name")
+        if saved_stage_name:
+            if saved_stage_name in stage_names:
+                return stage_names.index(saved_stage_name), int(payload.get("step", 0))
+            return 0, 0
         return int(payload.get("stage_idx", 0)), int(payload.get("step", 0))
 
 
@@ -389,7 +449,9 @@ class OptimizableGaussianState(nn.Module):
         self.register_buffer("bound_mode", torch.tensor(bound_mode, dtype=torch.bool))
         self.xyz_delta = nn.Parameter(xyz_delta)
         self.offset_delta = nn.Parameter(torch.zeros_like(base_offset))
-        self.shs = nn.Parameter(gs.shs.detach().clone())
+        self.register_buffer("anchor_shs", gs.shs.detach().clone())
+        self.register_buffer("appearance_delta_limit", torch.tensor(0.08, dtype=gs.shs.dtype, device=gs.shs.device))
+        self.shs_delta = nn.Parameter(torch.zeros_like(gs.shs.detach()))
         self.opacity_logit = nn.Parameter(_inverse_sigmoid(gs.opacity.detach().clone().clamp(1e-4, 1.0 - 1e-4)))
         self.log_scaling = nn.Parameter(gs.scaling.detach().clone().clamp_min(1e-8).log())
         self.rotation = nn.Parameter(gs.rotation.detach().clone())
@@ -408,6 +470,11 @@ class OptimizableGaussianState(nn.Module):
         return torch.exp(self.log_scaling)
 
     @property
+    def shs(self) -> torch.Tensor:
+        limit = self.appearance_delta_limit.to(device=self.shs_delta.device, dtype=self.shs_delta.dtype)
+        return self.anchor_shs + limit * torch.tanh(self.shs_delta)
+
+    @property
     def xyz(self) -> torch.Tensor:
         if bool(self.bound_mode.item()):
             return self.base_cano + self.base_offset + self.offset_delta
@@ -417,9 +484,13 @@ class OptimizableGaussianState(nn.Module):
     def offset(self) -> torch.Tensor:
         return self.base_offset + self.offset_delta
 
-    def set_trainable(self, appearance: bool, light_geometry: bool, xyz_geometry: bool) -> None:
-        self.shs.requires_grad_(appearance)
-        self.opacity_logit.requires_grad_(appearance)
+    def set_appearance_delta_limit(self, limit: float) -> None:
+        value = torch.tensor(float(max(limit, 0.0)), device=self.appearance_delta_limit.device, dtype=self.appearance_delta_limit.dtype)
+        self.appearance_delta_limit.copy_(value)
+
+    def set_trainable(self, appearance: bool, opacity: bool, light_geometry: bool, xyz_geometry: bool) -> None:
+        self.shs_delta.requires_grad_(appearance)
+        self.opacity_logit.requires_grad_(opacity)
         self.log_scaling.requires_grad_(light_geometry)
         self.rotation.requires_grad_(light_geometry)
         self.offset_delta.requires_grad_(light_geometry or xyz_geometry)
@@ -434,6 +505,9 @@ class OptimizableGaussianState(nn.Module):
     def scale_limit_loss(self, min_scale: float = 1e-4, max_scale: float = 0.08) -> torch.Tensor:
         scale = self.scaling
         return F.relu(min_scale - scale).square().mean() + F.relu(scale - max_scale).square().mean()
+
+    def appearance_anchor_loss(self) -> torch.Tensor:
+        return F.mse_loss(self.shs, self.anchor_shs)
 
     def to_gaussian_model(self) -> GaussianModel:
         return GaussianModel(
@@ -452,6 +526,7 @@ class OptimizableGaussianState(nn.Module):
             "offset_delta": self.offset_delta.detach().cpu(),
             "xyz_delta": self.xyz_delta.detach().cpu(),
             "effective_xyz": self.xyz.detach().cpu(),
+            "shs_delta": self.shs_delta.detach().cpu(),
         }
 
 
@@ -479,16 +554,15 @@ class OptimizableCameraState(nn.Module):
         view_indices = view_indices.to(device=c2ws.device, dtype=torch.long)
         scale = torch.exp(self.delta_log_scale)
         global_rot = _axis_angle_to_matrix(self.global_axis_angle).reshape(1, 1, 3, 3)
-        global_translation = self.global_translation.reshape(1, 1, 3)
-        out = c2ws.clone()
-        out[..., :3, :3] = torch.matmul(global_rot, c2ws[..., :3, :3])
-        out[..., :3, 3] = scale * torch.matmul(global_rot, c2ws[..., :3, 3:4]).squeeze(-1) + global_translation
+        global_translation = self.global_translation.reshape(1, 1, 3, 1)
+        rot = torch.matmul(global_rot, c2ws[..., :3, :3])
+        trans = scale * torch.matmul(global_rot, c2ws[..., :3, 3:4]) + global_translation
         per_view_rot = _axis_angle_to_matrix(self.per_view_axis_angle[view_indices]).unsqueeze(0)
-        per_view_translation = self.per_view_translation[view_indices].unsqueeze(0)
-        out = out.clone()
-        out[..., :3, :3] = torch.matmul(per_view_rot, out[..., :3, :3])
-        out[..., :3, 3] = torch.matmul(per_view_rot, out[..., :3, 3:4]).squeeze(-1) + per_view_translation
-        return out
+        per_view_translation = self.per_view_translation[view_indices].reshape(1, -1, 3, 1)
+        rot = torch.matmul(per_view_rot, rot)
+        trans = torch.matmul(per_view_rot, trans) + per_view_translation
+        upper = torch.cat([rot, trans], dim=-1)
+        return torch.cat([upper, c2ws[..., 3:4, :]], dim=-2)
 
 
 class OptimizableIntrinsicsState(nn.Module):
@@ -590,22 +664,40 @@ def compute_losses(
     weights: LossWeights,
     stage: RefinementStageConfig,
 ) -> Dict[str, torch.Tensor]:
-    mask = batch.masks.clamp(0, 1)
+    target_mask = batch.masks.clamp(0, 1)
+    mask = _rgb_loss_mask(render["comp_mask"], target_mask, stage.rgb_mask_mode)
+    mask_quality = _mask_quality_weights(
+        target_mask,
+        stage.mask_quality_min_coverage,
+        stage.mask_quality_max_coverage,
+        stage.mask_quality_max_border_fraction,
+    )
     rgb_l1 = (render["comp_rgb"] - batch.images).abs() * mask
-    rgb_loss = rgb_l1.sum() / mask.expand_as(render["comp_rgb"]).sum().clamp_min(1.0)
-    ssim_loss = _masked_ssim_loss(render["comp_rgb"], batch.images, mask) if stage.use_ssim else rgb_loss * 0.0
-    mask_l1 = F.l1_loss(render["comp_mask"], batch.masks)
-    mask_iou = _soft_iou_loss(render["comp_mask"], batch.masks)
-    mask_boundary = _boundary_mask_loss(render["comp_mask"], batch.masks)
-    landmark = _landmark_loss(context.landmark_2d, batch.landmarks_2d, batch.images.shape[-2:]) if stage.use_landmark else rgb_loss * 0.0
+    raw_rgb_loss = rgb_l1.sum() / mask.expand_as(render["comp_rgb"]).sum().clamp_min(1.0)
+    rgb_loss = raw_rgb_loss if stage.use_rgb_loss else raw_rgb_loss.detach() * 0.0
+    raw_ssim_loss = _masked_ssim_loss(render["comp_rgb"], batch.images, mask) if stage.use_ssim else raw_rgb_loss * 0.0
+    ssim_loss = raw_ssim_loss if (stage.use_rgb_loss and stage.use_ssim) else raw_ssim_loss.detach() * 0.0
+    raw_mask_l1 = (render["comp_mask"] - target_mask).abs().flatten(2).mean(dim=-1)
+    raw_mask_iou = _soft_iou_loss_per_view(render["comp_mask"], target_mask)
+    raw_mask_boundary = _boundary_mask_loss_per_view(render["comp_mask"], target_mask)
+    mask_l1 = _quality_weighted_mean(raw_mask_l1, mask_quality) if stage.use_mask_loss else raw_mask_l1.detach().mean() * 0.0
+    mask_iou = _quality_weighted_mean(raw_mask_iou, mask_quality) if stage.use_mask_loss else raw_mask_iou.detach().mean() * 0.0
+    mask_boundary = _quality_weighted_mean(raw_mask_boundary, mask_quality) if stage.use_mask_loss else raw_mask_boundary.detach().mean() * 0.0
+    if stage.use_landmark:
+        landmark, landmark_px = _landmark_loss(context.landmark_2d, batch.landmarks_2d, batch.images.shape[-2:], beta=stage.landmark_beta)
+    else:
+        landmark = raw_rgb_loss * 0.0
+        landmark_px = raw_rgb_loss.detach() * 0.0
     sim3_reg = camera_state.delta_log_scale.square().mean() + camera_state.global_axis_angle.square().mean() + camera_state.global_translation.square().mean()
     cam_reg = camera_state.per_view_axis_angle.square().mean() + camera_state.per_view_translation.square().mean()
+    colmap_relative_reg = _camera_relative_regularization(context.c2ws, context.base_c2ws, context.view_indices) if stage.use_colmap_relative_reg else cam_reg * 0.0
     intr_reg = intr_state.regularization()
     exposure_reg = exposure_state.regularization()
     xyz_anchor = F.mse_loss(gs.xyz, gs.anchor_xyz)
     offset_anchor = F.mse_loss(gs.offset, gs.anchor_offset)
     scale_anchor = F.mse_loss(gs.scaling, gs.anchor_scaling)
     opacity_reg = gs.opacity.mean()
+    appearance_anchor = gs.appearance_anchor_loss()
     expr_reg, jaw_reg, eyes_reg = expr_state.regularization()
     knn_anchor = gs.knn_anchor_loss() if stage.use_knn_anchor else rgb_loss * 0.0
     scale_limit = gs.scale_limit_loss()
@@ -618,12 +710,14 @@ def compute_losses(
         + weights.landmark * landmark
         + weights.sim3_reg * sim3_reg
         + weights.camera_delta_reg * cam_reg
+        + weights.colmap_relative_reg * colmap_relative_reg
         + weights.intrinsics_reg * intr_reg
         + weights.exposure_reg * exposure_reg
         + weights.xyz_anchor * xyz_anchor
         + weights.offset_anchor * offset_anchor
         + weights.scale_anchor * scale_anchor
         + weights.opacity_reg * opacity_reg
+        + weights.appearance_anchor * appearance_anchor
         + weights.expr_reg * expr_reg
         + weights.jaw_reg * jaw_reg
         + weights.eyes_reg * eyes_reg
@@ -637,15 +731,19 @@ def compute_losses(
         "mask": mask_l1.detach(),
         "mask_iou": mask_iou.detach(),
         "mask_boundary": mask_boundary.detach(),
+        "mask_quality": mask_quality.detach().mean(),
         "landmark": landmark.detach(),
+        "landmark_px": landmark_px.detach(),
         "sim3_reg": sim3_reg.detach(),
         "camera_delta_reg": cam_reg.detach(),
+        "colmap_relative_reg": colmap_relative_reg.detach(),
         "intrinsics_reg": intr_reg.detach(),
         "exposure_reg": exposure_reg.detach(),
         "xyz_anchor": xyz_anchor.detach(),
         "offset_anchor": offset_anchor.detach(),
         "scale_anchor": scale_anchor.detach(),
         "opacity_reg": opacity_reg.detach(),
+        "appearance_anchor": appearance_anchor.detach(),
         "expr_reg": expr_reg.detach(),
         "jaw_reg": jaw_reg.detach(),
         "eyes_reg": eyes_reg.detach(),
@@ -667,6 +765,71 @@ def _add_group(groups: list, params: list[torch.nn.Parameter], lr: float, decay_
     active = [p for p in params if p.requires_grad]
     if active:
         groups.append({"params": active, "lr": lr, "_decay_ratio": decay_ratio})
+
+
+def _filter_compatible_state_dict(module: nn.Module, payload: dict) -> dict:
+    current = module.state_dict()
+    filtered = {}
+    for key, value in payload.items():
+        if key in current and getattr(value, "shape", None) == current[key].shape:
+            filtered[key] = value
+    return filtered
+
+
+def _rgb_loss_mask(pred_mask: torch.Tensor, target_mask: torch.Tensor, mode: str) -> torch.Tensor:
+    target = target_mask.clamp(0, 1)
+    render = pred_mask.detach().clamp(0, 1)
+    if mode == "target":
+        mask = target
+    elif mode == "render":
+        mask = render
+    elif mode == "render_target_union":
+        mask = torch.maximum(render, target)
+    elif mode == "render_target_intersection":
+        mask = render * target
+    else:
+        raise ValueError(f"Unknown rgb_mask_mode: {mode}")
+    return mask.clamp(0, 1)
+
+
+def _mask_quality_weights(target_mask: torch.Tensor, min_coverage: float, max_coverage: float, max_border_fraction: float) -> torch.Tensor:
+    binary = (target_mask.detach().clamp(0, 1) > 0.2).float()
+    if binary.ndim == 5 and binary.shape[2] == 1:
+        binary = binary[:, :, 0]
+    coverage = binary.flatten(2).mean(dim=-1)
+    top = binary[..., 0, :].mean(dim=-1)
+    bottom = binary[..., -1, :].mean(dim=-1)
+    left = binary[..., :, 0].mean(dim=-1)
+    right = binary[..., :, -1].mean(dim=-1)
+    border_fraction = (top + bottom + left + right) * 0.25
+    valid = (
+        (coverage >= float(min_coverage))
+        & (coverage <= float(max_coverage))
+        & (border_fraction <= float(max_border_fraction))
+    )
+    return valid.to(device=target_mask.device, dtype=target_mask.dtype)
+
+
+def _quality_weighted_mean(values: torch.Tensor, quality: torch.Tensor) -> torch.Tensor:
+    quality = quality.to(device=values.device, dtype=values.dtype)
+    denom = quality.sum()
+    if float(denom.detach().cpu()) <= 0.0:
+        return values.sum() * 0.0
+    return (values * quality).sum() / denom.clamp_min(1.0)
+
+
+def _camera_relative_regularization(c2ws: torch.Tensor, base_c2ws: torch.Tensor, view_indices: Optional[torch.Tensor]) -> torch.Tensor:
+    if c2ws.shape[1] < 2:
+        return c2ws.sum() * 0.0
+    if view_indices is not None:
+        order = torch.argsort(view_indices.to(c2ws.device))
+        c2ws = c2ws[:, order]
+        base_c2ws = base_c2ws[:, order]
+    rel = torch.matmul(torch.linalg.inv(c2ws[:, :-1]), c2ws[:, 1:])
+    base_rel = torch.matmul(torch.linalg.inv(base_c2ws[:, :-1]), base_c2ws[:, 1:])
+    rot_loss = F.smooth_l1_loss(rel[..., :3, :3], base_rel[..., :3, :3])
+    trans_loss = F.smooth_l1_loss(rel[..., :3, 3], base_rel[..., :3, 3])
+    return rot_loss + trans_loss
 
 
 def _scale_batch(batch: MultiViewBatch, scale: float) -> MultiViewBatch:
@@ -720,19 +883,22 @@ def _project_points(points: torch.Tensor, c2ws: torch.Tensor, intrs: torch.Tenso
     ones = torch.ones_like(points[..., :1])
     homog = torch.cat([points, ones], dim=-1)
     cam = torch.matmul(w2cs[:, :, None], homog[..., None]).squeeze(-1)[..., :3]
-    z = cam[..., 2].clamp_min(1e-6)
-    u = intrs[:, :, None, 0, 0] * (cam[..., 0] / z) + intrs[:, :, None, 0, 2]
-    v = intrs[:, :, None, 1, 1] * (cam[..., 1] / z) + intrs[:, :, None, 1, 2]
-    return torch.stack([u.clamp(-width, 2 * width), v.clamp(-height, 2 * height)], dim=-1)
+    z = cam[..., 2]
+    eps = torch.full_like(z, 1e-6)
+    denom = torch.where(z.abs() > eps, z, torch.where(z >= 0, eps, -eps))
+    u = intrs[:, :, None, 0, 0] * (cam[..., 0] / denom) + intrs[:, :, None, 0, 2]
+    v = intrs[:, :, None, 1, 1] * (cam[..., 1] / denom) + intrs[:, :, None, 1, 2]
+    return torch.stack([u.clamp(-4 * width, 5 * width), v.clamp(-4 * height, 5 * height)], dim=-1)
 
 
-def _landmark_loss(pred: Optional[torch.Tensor], target: Optional[torch.Tensor], image_hw: tuple[int, int]) -> torch.Tensor:
+def _landmark_loss(pred: Optional[torch.Tensor], target: Optional[torch.Tensor], image_hw: tuple[int, int], beta: float = 0.002) -> tuple[torch.Tensor, torch.Tensor]:
     if pred is None or target is None:
         ref = pred if pred is not None else target
-        return torch.tensor(0.0, device=ref.device if ref is not None else "cpu")
+        zero = torch.tensor(0.0, device=ref.device if ref is not None else "cpu")
+        return zero, zero
     target_xy = target[..., :2]
+    h, w = image_hw
     if not _landmarks_are_pixels(target):
-        h, w = image_hw
         target_xy = target_xy.clone()
         target_xy[..., 0] *= w
         target_xy[..., 1] *= h
@@ -743,8 +909,30 @@ def _landmark_loss(pred: Optional[torch.Tensor], target: Optional[torch.Tensor],
     if target.shape[-1] > 2:
         valid = valid & (target[..., :count, 2] > 0)
     if not valid.any():
-        return pred.sum() * 0.0
-    return F.smooth_l1_loss(pred[valid], target_xy[valid])
+        zero = pred.sum() * 0.0
+        return zero, zero.detach()
+    scale = torch.tensor([float(w), float(h)], device=pred.device, dtype=pred.dtype)
+    residual = (pred - target_xy) / scale
+    weights = _landmark_semantic_weights(count, pred.device, pred.dtype).reshape(1, 1, count, 1)
+    valid_f = valid.to(dtype=pred.dtype).unsqueeze(-1)
+    loss_map = F.smooth_l1_loss(residual, torch.zeros_like(residual), beta=float(beta), reduction="none")
+    weighted = loss_map * weights * valid_f
+    denom = ((weights * valid_f).sum() * residual.shape[-1]).clamp_min(1.0)
+    loss = weighted.sum() / denom
+    px_error = torch.linalg.norm(pred - target_xy, dim=-1)
+    px = (px_error * valid.to(dtype=pred.dtype)).sum() / valid.to(dtype=pred.dtype).sum().clamp_min(1.0)
+    return loss, px
+
+
+def _landmark_semantic_weights(count: int, device, dtype) -> torch.Tensor:
+    weights = torch.ones(count, device=device, dtype=dtype)
+    if count >= 68:
+        weights[:17] = 0.35
+        weights[17:27] = 0.8
+        weights[27:36] = 1.25
+        weights[36:48] = 1.35
+        weights[48:68] = 1.0
+    return weights
 
 
 def _landmarks_are_pixels(landmarks: torch.Tensor) -> bool:
@@ -767,15 +955,15 @@ def _masked_ssim_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
     return ((1.0 - ssim.clamp(-1, 1)) * weight).sum() / weight.sum().clamp_min(1.0)
 
 
-def _soft_iou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _soft_iou_loss_per_view(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred = pred.clamp(0, 1)
     target = target.clamp(0, 1)
-    inter = (pred * target).sum()
-    union = (pred + target - pred * target).sum().clamp_min(1.0)
+    inter = (pred * target).flatten(2).sum(dim=-1)
+    union = (pred + target - pred * target).flatten(2).sum(dim=-1).clamp_min(1.0)
     return 1.0 - inter / union
 
 
-def _boundary_mask_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _boundary_mask_loss_per_view(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred = pred.clamp(0, 1)
     target = target.clamp(0, 1)
     h, w = target.shape[-2:]
@@ -783,7 +971,7 @@ def _boundary_mask_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     dilated = F.max_pool2d(target.flatten(0, 1), k, 1, k // 2)
     eroded = -F.max_pool2d(-target.flatten(0, 1), k, 1, k // 2)
     boundary = (dilated - eroded).reshape_as(target)
-    return ((pred - target).abs() * boundary).sum() / boundary.sum().clamp_min(1.0)
+    return ((pred - target).abs() * boundary).flatten(2).sum(dim=-1) / boundary.flatten(2).sum(dim=-1).clamp_min(1.0)
 
 
 def _build_knn_edges(xyz: torch.Tensor, k: int, max_points: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

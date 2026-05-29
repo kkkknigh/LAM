@@ -16,6 +16,7 @@ import os
 import cv2
 import sys
 import base64
+import json
 import subprocess
 
 import gradio as gr
@@ -207,6 +208,65 @@ def create_zip_archive(output_zip='runtime_/h5_render_data.zip', base_vid="nice"
         print(f"An error occurred: {e}")
 
 
+def _safe_stem(name):
+    stem = Path(name).stem
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return safe or "lam_input"
+
+
+def save_layer1_lam_package(base_iid, cano_gs, shape_param, frame_param_dir=None, reference_transforms_path=None, output_root="./output/layer1_lam"):
+    from datetime import datetime
+    import shutil
+
+    safe_iid = _safe_stem(base_iid)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    package_dir = Path(output_root) / f"{safe_iid}_{run_id}"
+    layer1_dir = package_dir / "layer1_lam"
+    flame_dst = layer1_dir / "flame_param"
+    layer1_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical_ply = layer1_dir / f"{safe_iid}_canonical.ply"
+    cano_gs.save_ply(str(canonical_ply), rgb2sh=False, offset2xyz=False)
+
+    shape = shape_param.detach().cpu().numpy()
+    np.savez(layer1_dir / "canonical_flame_param.npz", shape=shape, betas=shape)
+
+    xyz = cano_gs.xyz.detach().cpu().float().numpy()
+    canonical_center = xyz.mean(axis=0)
+    canonical_radius_p95 = float(np.percentile(np.linalg.norm(xyz - canonical_center, axis=1), 95))
+    metadata = {
+        "canonical_center": canonical_center.tolist(),
+        "canonical_radius_p95": canonical_radius_p95,
+    }
+
+    if reference_transforms_path and os.path.isfile(reference_transforms_path):
+        ref_dst = layer1_dir / "layer1_reference_transforms.json"
+        shutil.copy2(reference_transforms_path, ref_dst)
+        try:
+            ref_db = json.loads(Path(reference_transforms_path).read_text(encoding="utf-8"))
+            ref_frame = ref_db.get("frames", [None])[0]
+            if ref_frame is not None:
+                metadata["reference_camera"] = ref_frame
+        except Exception as e:
+            metadata["reference_camera_error"] = str(e)
+
+    (layer1_dir / "layer1_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    if frame_param_dir and os.path.isdir(frame_param_dir):
+        flame_dst.mkdir(parents=True, exist_ok=True)
+        for src in sorted(Path(frame_param_dir).glob("*.npz")):
+            shutil.copy2(src, flame_dst / src.name)
+
+    zip_path = package_dir / "layer1_lam.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for path in sorted(layer1_dir.rglob("*")):
+            if path.is_file():
+                zipf.write(path, arcname=str(path.relative_to(package_dir)).replace("\\", "/"))
+
+    print(f"Layer1 LAM package saved: {zip_path}")
+    return str(zip_path)
+
+
 def expand_motion_seq_for_turntable(motion_seq, num_views=49, yaw_degrees=60):
     c2ws = motion_seq["render_c2ws"]
     device = c2ws.device
@@ -274,7 +334,7 @@ def demo_lam(flametracking, lam, cfg):
         dump_tmp_dir = dump_image_dir
 
         if os.path.exists(dump_video_path):
-            return dump_image_path, dump_video_path
+            return dump_image_path, dump_video_path, ""
 
         motion_img_need_mask = cfg.get("motion_img_need_mask", False)  # False
         vis_motion = cfg.get("vis_motion", False)  # False
@@ -333,6 +393,14 @@ def demo_lam(flametracking, lam, cfg):
                                         render_intrs=motion_seq["render_intrs"].to(device),
                                         render_bg_colors=motion_seq["render_bg_colors"].to(device),
                                         flame_params={k:v.to(device) for k, v in motion_seq["flame_params"].items()})
+
+        layer1_zip_path = save_layer1_lam_package(
+            base_iid=base_iid,
+            cano_gs=res["cano_gs_lst"][0],
+            shape_param=shape_param,
+            frame_param_dir=os.path.join(output_dir, "flame_param"),
+            reference_transforms_path=os.path.join(output_dir, "transforms.json"),
+        )
         
         # save h5 rendering info
         if h5_rendering:
@@ -344,6 +412,7 @@ def demo_lam(flametracking, lam, cfg):
             if base_vid:
                 create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
 
+        oac_zip_path = ''
         if enable_oac_file:
             try:
                 from tools.generateARKITGLBWithBlender import generate_glb
@@ -365,16 +434,16 @@ def demo_lam(flametracking, lam, cfg):
                 )
                 os.remove(saved_head_path)
 
-                output_zip_path = os.path.join('./output/open_avatar_chat', base_iid + '.zip')
-                if os.path.exists(output_zip_path):
-                    os.remove(output_zip_path)
+                oac_zip_path = os.path.join('./output/open_avatar_chat', base_iid + '.zip')
+                if os.path.exists(oac_zip_path):
+                    os.remove(oac_zip_path)
                 original_cwd = os.getcwd()
                 oac_parent_dir = os.path.dirname(oac_dir)
                 base_iid_dir = os.path.basename(oac_dir)
                 os.chdir(oac_parent_dir)
                 try:
                     patoolib.create_archive(
-                        archive=os.path.abspath(output_zip_path),
+                        archive=os.path.abspath(oac_zip_path),
                         filenames=[base_iid_dir],
                         verbosity=-1,
                         program='zip'
@@ -383,7 +452,7 @@ def demo_lam(flametracking, lam, cfg):
                     os.chdir(original_cwd)
                 shutil.rmtree(oac_dir)
             except Exception as e:
-                output_zip_path = f"Archive creation failed: {str(e)}"
+                oac_zip_path = f"Archive creation failed: {str(e)}"
 
         rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
         mask = res["comp_mask"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
@@ -407,7 +476,10 @@ def demo_lam(flametracking, lam, cfg):
                 dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
                 add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
 
-        return dump_image_path, dump_video_path_wa, output_zip_path if enable_oac_file else ''
+        export_paths = f"Layer1 LAM ZIP: {layer1_zip_path}"
+        if enable_oac_file:
+            export_paths += f"\nOAC ZIP: {oac_zip_path}"
+        return dump_image_path, dump_video_path_wa, export_paths
 
     with gr.Blocks(analytics_enabled=False) as demo:
 
@@ -507,8 +579,8 @@ def demo_lam(flametracking, lam, cfg):
                 output_zip_textbox = gr.Textbox(
                     label="Export ZIP File Path",
                     interactive=False,
-                    placeholder="Export ZIP File Path ...",
-                    visible=os.path.exists(cfg.blender_path)
+                    placeholder="Layer1 LAM ZIP path ...",
+                    visible=True
                 )
 
         if h5_rendering:

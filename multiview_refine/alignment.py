@@ -2,7 +2,7 @@
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 import numpy as np
 
@@ -224,14 +224,6 @@ def align_colmap_to_flame(
         encoding="utf-8",
     )
     sim3.save(output_sim3)
-    return sim3
-
-
-def write_manual_sim3(path: str | Path, scale: float, yaw_degrees: float, translation: Iterable[float]) -> Sim3Alignment:
-    yaw = np.deg2rad(yaw_degrees)
-    R = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]], dtype=np.float32)
-    sim3 = Sim3Alignment(scale=float(scale), rotation=R.tolist(), translation=list(map(float, translation)), rmse=-1.0, source="manual")
-    sim3.save(path)
     return sim3
 
 

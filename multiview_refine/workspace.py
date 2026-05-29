@@ -1,4 +1,3 @@
-import json
 import shutil
 import time
 import zipfile
@@ -12,25 +11,84 @@ class MultiViewWorkspace:
     root: Path
 
     @property
+    def inputs_dir(self) -> Path:
+        return self.root / "inputs"
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root / "data"
+
+    @property
     def images_dir(self) -> Path:
-        return self.root / "images"
+        return self.data_dir / "images"
 
     @property
     def masks_dir(self) -> Path:
-        fg_masks = self.root / "fg_masks"
-        return fg_masks if fg_masks.exists() else self.root / "masks"
+        return self.data_dir / "fg_masks"
 
     @property
     def flame_dir(self) -> Path:
-        return self.root / "flame_param"
+        return self.data_dir / "flame_param"
 
     @property
     def landmark_dir(self) -> Path:
-        return self.root / "landmark2d"
+        return self.data_dir / "landmark2d"
+
+    @property
+    def init_ply_path(self) -> Path:
+        return self.data_dir / "init.ply"
+
+    @property
+    def canonical_flame_path(self) -> Path:
+        return self.data_dir / "canonical_flame_param.npz"
+
+    @property
+    def layer1_metadata_path(self) -> Path:
+        return self.data_dir / "layer1_metadata.json"
+
+    @property
+    def layer1_reference_transforms_path(self) -> Path:
+        return self.data_dir / "layer1_reference_transforms.json"
 
     @property
     def colmap_dir(self) -> Path:
         return self.root / "colmap"
+
+    @property
+    def colmap_transforms_path(self) -> Path:
+        return self.colmap_dir / "transforms_colmap_raw.json"
+
+    @property
+    def alignment_dir(self) -> Path:
+        return self.root / "alignment"
+
+    @property
+    def aligned_transforms_path(self) -> Path:
+        return self.alignment_dir / "transforms_aligned.json"
+
+    @property
+    def sim3_path(self) -> Path:
+        return self.alignment_dir / "sim3_colmap_to_lam.json"
+
+    @property
+    def tracking_dir(self) -> Path:
+        return self.root / "tracking_work"
+
+    @property
+    def refine_dir(self) -> Path:
+        return self.root / "refine"
+
+    @property
+    def refined_gaussian_path(self) -> Path:
+        return self.refine_dir / "refined_gaussian.ply"
+
+    @property
+    def loss_history_path(self) -> Path:
+        return self.refine_dir / "loss_history.jsonl"
+
+    @property
+    def exports_dir(self) -> Path:
+        return self.root / "exports"
 
     @property
     def debug_dir(self) -> Path:
@@ -38,36 +96,41 @@ class MultiViewWorkspace:
 
     @property
     def checkpoint_dir(self) -> Path:
-        return self.root / "checkpoints"
-
-    @property
-    def state_path(self) -> Path:
-        return self.root / "workspace_state.json"
-
-    def write_state(self, **updates) -> dict:
-        state = {}
-        if self.state_path.exists():
-            state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        state.update({k: _jsonable(v) for k, v in updates.items()})
-        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        return state
-
+        return self.refine_dir / "checkpoints"
 
 def create_workspace(output_root: str | Path = "output/multiview_refine", job_id: Optional[str] = None) -> MultiViewWorkspace:
     output_root = Path(output_root)
     job_id = job_id or time.strftime("%Y%m%d_%H%M%S")
     ws = MultiViewWorkspace(output_root / job_id)
-    for path in [ws.root, ws.debug_dir, ws.checkpoint_dir]:
+    suffix = 1
+    while ws.root.exists() and any(ws.root.iterdir()):
+        ws = MultiViewWorkspace(output_root / f"{job_id}_{suffix:02d}")
+        suffix += 1
+    for path in [
+        ws.root,
+        ws.inputs_dir,
+        ws.data_dir,
+        ws.colmap_dir,
+        ws.alignment_dir,
+        ws.tracking_dir,
+        ws.refine_dir,
+        ws.debug_dir,
+        ws.checkpoint_dir,
+        ws.exports_dir,
+    ]:
         path.mkdir(parents=True, exist_ok=True)
-    ws.write_state(job_id=job_id, root=str(ws.root), created_at=time.time())
     return ws
 
 
 def unpack_camera_images_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -> MultiViewWorkspace:
-    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_upload_camera_images")
+    zip_path = Path(zip_path)
+    shutil.copy2(zip_path, workspace.inputs_dir / zip_path.name)
+    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_tmp_camera_images")
     content_root = _single_top_folder(source_root)
-    image_source = content_root / "images" if (content_root / "images").is_dir() else content_root
-    image_files = _image_files(image_source)
+    if (content_root / "images").is_dir():
+        image_files = _image_files(content_root / "images")
+    else:
+        image_files = sorted([p for p in content_root.iterdir() if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
     if not image_files:
         raise FileNotFoundError(f"No images found in camera image ZIP: {zip_path}")
     if workspace.images_dir.exists():
@@ -75,13 +138,21 @@ def unpack_camera_images_zip(zip_path: str | Path, workspace: MultiViewWorkspace
     workspace.images_dir.mkdir(parents=True, exist_ok=True)
     for image_path in image_files:
         shutil.copy2(image_path, workspace.images_dir / image_path.name)
+    mask_source = None
+    if (content_root / "fg_masks").is_dir():
+        mask_source = content_root / "fg_masks"
+    elif (content_root / "masks").is_dir():
+        mask_source = content_root / "masks"
+    if mask_source is not None:
+        _copy_dir(mask_source, workspace.masks_dir)
     shutil.rmtree(source_root)
-    workspace.write_state(camera_images_zip=str(zip_path), camera_images=len(image_files))
     return workspace
 
 
 def unpack_layer1_lam_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -> MultiViewWorkspace:
-    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_upload_layer1_lam")
+    zip_path = Path(zip_path)
+    shutil.copy2(zip_path, workspace.inputs_dir / zip_path.name)
+    source_root = _extract_zip_to_temp(zip_path, workspace.root / "_tmp_layer1_lam")
     content_root = _single_top_folder(source_root)
 
     init_ply = _find_layer1_canonical_ply(content_root)
@@ -91,11 +162,15 @@ def unpack_layer1_lam_zip(zip_path: str | Path, workspace: MultiViewWorkspace) -
             "Layer 1 LAM package must contain canonical_flame_param.npz or *_canonical_flame_param.npz."
         )
 
-    shutil.copy2(init_ply, workspace.root / "init.ply")
-    shutil.copy2(canonical_flame, workspace.root / "canonical_flame_param.npz")
-    _copy_layer1_frame_params(content_root, workspace.root / "layer1_frame_param")
+    shutil.copy2(init_ply, workspace.init_ply_path)
+    shutil.copy2(canonical_flame, workspace.canonical_flame_path)
+    metadata = content_root / "layer1_metadata.json"
+    if metadata.exists():
+        shutil.copy2(metadata, workspace.layer1_metadata_path)
+    reference_transforms = content_root / "layer1_reference_transforms.json"
+    if reference_transforms.exists():
+        shutil.copy2(reference_transforms, workspace.layer1_reference_transforms_path)
     shutil.rmtree(source_root)
-    workspace.write_state(layer1_lam_zip=str(zip_path), init_ply="init.ply", canonical_flame_param="canonical_flame_param.npz")
     return workspace
 
 
@@ -109,19 +184,18 @@ def import_local_inputs(
 ) -> MultiViewWorkspace:
     _copy_dir(Path(image_dir), workspace.images_dir)
     if mask_dir:
-        _copy_dir(Path(mask_dir), workspace.root / "fg_masks")
+        _copy_dir(Path(mask_dir), workspace.masks_dir)
     if flame_dir:
         flame_dir = Path(flame_dir)
         source_flame_param = flame_dir / "flame_param" if (flame_dir / "flame_param").is_dir() else flame_dir
         _copy_dir(source_flame_param, workspace.flame_dir)
         canonical = flame_dir / "canonical_flame_param.npz"
         if canonical.exists():
-            shutil.copy2(canonical, workspace.root / "canonical_flame_param.npz")
+            shutil.copy2(canonical, workspace.canonical_flame_path)
     if colmap_dir:
         _copy_dir(Path(colmap_dir), workspace.colmap_dir)
     if init_ply:
-        shutil.copy2(init_ply, workspace.root / "init.ply")
-    workspace.write_state(imported=True)
+        shutil.copy2(init_ply, workspace.init_ply_path)
     return workspace
 
 
@@ -142,9 +216,8 @@ def validate_workspace_inputs(workspace: MultiViewWorkspace, require_masks: bool
         "missing_masks": missing_masks,
         "has_flame": workspace.flame_dir.exists(),
         "has_colmap": workspace.colmap_dir.exists(),
-        "has_init_ply": (workspace.root / "init.ply").exists(),
+        "has_init_ply": workspace.init_ply_path.exists(),
     }
-    workspace.write_state(validation=report)
     return report
 
 
@@ -226,28 +299,3 @@ def _find_canonical_flame_param(root: Path) -> Optional[Path]:
         return suffix[0]
     return None
 
-
-def _copy_layer1_frame_params(root: Path, dst: Path) -> None:
-    candidates = [
-        p for p in root.rglob("*.npz")
-        if p.is_file() and p.name != "canonical_flame_param.npz" and not p.name.endswith("_canonical_flame_param.npz")
-    ]
-    if (root / "flame_param").is_dir():
-        candidates.extend([p for p in (root / "flame_param").glob("*.npz") if p.is_file()])
-    if not candidates:
-        return
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
-    seen = set()
-    for src in sorted(candidates):
-        if src.resolve() in seen:
-            continue
-        seen.add(src.resolve())
-        shutil.copy2(src, dst / src.name)
-
-
-def _jsonable(value):
-    if isinstance(value, Path):
-        return str(value)
-    return value

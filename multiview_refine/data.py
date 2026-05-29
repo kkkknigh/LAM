@@ -51,9 +51,12 @@ def load_multiview_bundle(
 
 def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.json", require_undistorted: bool = True) -> List[MultiViewFrame]:
     root = Path(root)
-    transforms_path = root / transforms_name
-    if not transforms_path.exists():
-        transforms_path = root / "transforms.json"
+    transforms_path = Path(transforms_name)
+    if not transforms_path.is_absolute():
+        if transforms_path.name == "transforms_aligned.json":
+            transforms_path = root / "alignment" / transforms_path.name
+        else:
+            transforms_path = root / transforms_path
     if not transforms_path.exists():
         raise FileNotFoundError(f"No transforms found under {root}")
     db = json.loads(transforms_path.read_text(encoding="utf-8"))
@@ -68,12 +71,12 @@ def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.jso
         image_value = item.get("file_path") or item.get("image_path") or item.get("image_name")
         if not image_value:
             raise KeyError(f"Frame {idx} is missing file_path/image_path/image_name")
-        image_path = _resolve(root, image_value, image_dirs=["images"])
-        mask_path = _resolve_optional(root, item.get("fg_mask_path") or item.get("mask_path"), image_path.stem, ["fg_masks", "masks"])
+        image_path = _resolve(root, image_value, image_dirs=["data/images"])
+        mask_path = _resolve_optional(root, item.get("fg_mask_path") or item.get("mask_path"), image_path.stem, ["data/fg_masks"])
         if mask_path is None:
             raise FileNotFoundError(f"Missing mask for {image_path.name}; upload or generate masks first.")
-        flame_path = _resolve_optional(root, item.get("flame_param_path"), image_path.stem, ["flame_param"])
-        landmark_path = _resolve_optional(root, item.get("landmark_path"), image_path.stem, ["landmark2d"])
+        flame_path = _resolve_optional(root, item.get("flame_param_path"), image_path.stem, ["data/flame_param"])
+        landmark_path = _resolve_optional(root, item.get("landmark_path"), image_path.stem, ["data/landmark2d"])
         flame_params = _load_flame(flame_path) if flame_path else {}
         if "betas" not in flame_params:
             flame_params["betas"] = _load_betas(root)
@@ -96,18 +99,21 @@ def load_frames(root: str | Path, transforms_name: str = "transforms_aligned.jso
 def write_lam_transforms_from_colmap(root: str | Path, colmap_json: str | Path, out_name: str = "transforms_colmap_raw.json") -> Path:
     root = Path(root)
     db = json.loads(Path(colmap_json).read_text(encoding="utf-8"))
-    image_by_name = {p.name: p for p in sorted((root / "images").glob("*")) if p.suffix.lower() in {".png", ".jpg", ".jpeg"}}
+    image_by_name = {p.name: p for p in sorted((root / "data" / "images").glob("*")) if p.suffix.lower() in {".png", ".jpg", ".jpeg"}}
     frames = []
     for idx, frame in enumerate(db["frames"]):
         name = Path(frame["image_name"]).name
         if name not in image_by_name:
             continue
         out = dict(frame)
-        out["file_path"] = f"images/{name}"
+        out["transform_matrix_colmap_opencv"] = frame["transform_matrix"]
+        out["transform_matrix"] = _opencv_c2w_to_json_c2w(np.asarray(frame["transform_matrix"], dtype=np.float32)).tolist()
+        out["camera_convention"] = "nerf_json_yz_flip_from_colmap_opencv"
+        out["file_path"] = f"data/images/{name}"
         stem = image_by_name[name].stem
-        mask = _resolve_optional(root, None, stem, ["fg_masks", "masks"])
-        flame = _resolve_optional(root, None, stem, ["flame_param"])
-        landmark = _resolve_optional(root, None, stem, ["landmark2d"])
+        mask = _resolve_optional(root, None, stem, ["data/fg_masks"])
+        flame = _resolve_optional(root, None, stem, ["data/flame_param"])
+        landmark = _resolve_optional(root, None, stem, ["data/landmark2d"])
         if mask:
             out["fg_mask_path"] = str(mask.relative_to(root)).replace("\\", "/")
         if flame:
@@ -118,6 +124,7 @@ def write_lam_transforms_from_colmap(root: str | Path, colmap_json: str | Path, 
         out["camera_index"] = idx
         frames.append(out)
     out_path = root / out_name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({"frames": frames}, indent=2), encoding="utf-8")
     return out_path
 
@@ -126,6 +133,12 @@ def _load_c2w(frame: dict) -> torch.Tensor:
     c2w = np.array(frame["transform_matrix"], dtype=np.float32)
     c2w[:3, 1:3] *= -1
     return torch.from_numpy(c2w)
+
+
+def _opencv_c2w_to_json_c2w(c2w: np.ndarray) -> np.ndarray:
+    out = np.asarray(c2w, dtype=np.float32).copy()
+    out[:3, 1:3] *= -1
+    return out
 
 
 def _load_intr(frame: dict) -> torch.Tensor:
@@ -189,7 +202,7 @@ def _load_flame(path: Path) -> TensorDict:
 
 
 def _load_betas(root: Path) -> torch.Tensor:
-    path = root / "canonical_flame_param.npz"
+    path = root / "data" / "canonical_flame_param.npz"
     if not path.exists():
         raise FileNotFoundError(f"Missing canonical_flame_param.npz under {root}")
     raw = np.load(path, allow_pickle=True)

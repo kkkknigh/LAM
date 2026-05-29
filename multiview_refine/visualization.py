@@ -47,13 +47,13 @@ def save_workspace_image_previews(root: str | Path, out_dir: str | Path, max_ite
     root = Path(root)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    images = sorted([p for p in (root / "images").glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
+    images = sorted([p for p in (root / "data" / "images").glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
     saved = []
     for idx, image_path in enumerate(images[:max_items]):
         stem = image_path.stem
         image = _load_image_uint8(image_path)
-        mask_path = _find_by_stem(root, stem, ["fg_masks", "masks"], [".png", ".jpg", ".jpeg"])
-        landmark_path = _find_by_stem(root, stem, ["landmark2d"], [".npz"])
+        mask_path = _find_by_stem(root, stem, ["data/fg_masks"], [".png", ".jpg", ".jpeg"])
+        landmark_path = _find_by_stem(root, stem, ["data/landmark2d"], [".npz"])
         mask = _load_mask_uint8(mask_path, image.shape[:2]) if mask_path else np.full(image.shape[:2], 255, dtype=np.uint8)
         masked = (image.astype(np.float32) * (mask[..., None] / 255.0) + 255.0 * bg_color * (1.0 - mask[..., None] / 255.0)).clip(0, 255).astype(np.uint8)
         landmark = image.copy()
@@ -163,8 +163,11 @@ def save_loss_plot(jsonl_path: str | Path, out_path: str | Path) -> Optional[str
         "mask_iou",
         "mask_boundary",
         "landmark",
+        "landmark_px",
+        "mask_quality",
         "sim3_reg",
         "camera_delta_reg",
+        "colmap_relative_reg",
         "intrinsics_reg",
         "exposure_reg",
         "expr_reg",
@@ -174,6 +177,7 @@ def save_loss_plot(jsonl_path: str | Path, out_path: str | Path) -> Optional[str
         "offset_anchor",
         "scale_anchor",
         "opacity_reg",
+        "appearance_anchor",
         "knn_anchor",
         "scale_limit",
     ]
@@ -192,14 +196,33 @@ def save_loss_plot(jsonl_path: str | Path, out_path: str | Path) -> Optional[str
     ]
     x_values = np.arange(len(rows), dtype=np.float32)
     x_span = max(float(len(rows) - 1), 1.0)
+    scale_groups = {
+        "total": ["total"],
+        "data": ["rgb", "ssim", "mask", "mask_iou", "mask_boundary", "mask_quality"],
+        "landmark": ["landmark"],
+        "landmark_px": ["landmark_px"],
+    }
+    global_ranges = {}
+    for group_name, keys in scale_groups.items():
+        vals = []
+        for key in keys:
+            vals.extend([row.get(key, np.nan) for row in rows])
+        vals = np.asarray(vals, dtype=np.float32)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            global_ranges[group_name] = (float(vals.min()), float(vals.max()))
     for metric_idx, metric in enumerate(metrics):
         values = np.asarray([row.get(metric, np.nan) for row in rows], dtype=np.float32)
         valid = np.isfinite(values)
         if valid.sum() < 1:
             continue
         finite_values = values[valid]
-        mn = float(finite_values.min())
-        mx = float(finite_values.max())
+        range_key = next((name for name, keys in scale_groups.items() if metric in keys), None)
+        if range_key in global_ranges:
+            mn, mx = global_ranges[range_key]
+        else:
+            mn = float(finite_values.min())
+            mx = float(finite_values.max())
         span = max(mx - mn, 1e-8)
         points = []
         for x, value, is_valid in zip(x_values, values, valid):
@@ -221,6 +244,14 @@ def save_loss_plot(jsonl_path: str | Path, out_path: str | Path) -> Optional[str
         if ly + 14 < height:
             draw.rectangle((lx, ly + 4, lx + 14, ly + 14), fill=color)
             draw.text((lx + 20, ly), metric, fill=(60, 67, 80))
+    previous_stage = None
+    for i, row in enumerate(rows):
+        stage = row.get("stage")
+        if i > 0 and stage != previous_stage:
+            px = box[0] + 12 + int((i / x_span) * (box[2] - box[0] - 24))
+            draw.line([(px, box[1] + 1), (px, box[3] - 1)], fill=(180, 185, 195), width=1)
+            draw.text((px + 4, box[1] + 4), str(stage), fill=(90, 96, 110))
+        previous_stage = stage
     image.save(out_path)
     return str(out_path)
 

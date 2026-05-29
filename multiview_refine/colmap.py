@@ -65,7 +65,16 @@ def run_colmap_pipeline(image_dir: str | Path, colmap_dir: str | Path, colmap_pa
     database_path = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
     sparse_dir.mkdir(parents=True, exist_ok=True)
-    _run([colmap_path, "feature_extractor", "--database_path", str(database_path), "--image_path", str(image_dir)])
+    _run([
+        colmap_path,
+        "feature_extractor",
+        "--database_path",
+        str(database_path),
+        "--image_path",
+        str(image_dir),
+        "--ImageReader.camera_model",
+        "PINHOLE",
+    ])
     _run([colmap_path, "exhaustive_matcher", "--database_path", str(database_path)])
     _run([colmap_path, "mapper", "--database_path", str(database_path), "--image_path", str(image_dir), "--output_path", str(sparse_dir)])
     model_dir = sparse_dir / "0"
