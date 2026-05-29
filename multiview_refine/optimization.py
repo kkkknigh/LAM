@@ -129,7 +129,7 @@ class RefinementConfig:
         ),
         RefinementStageConfig(
             "geometry_xyz",
-            steps=100,
+            steps=200,
             lr=2e-4,
             resolution_scale=0.5,
             optimize_geometry=True,
