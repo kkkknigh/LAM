@@ -191,6 +191,15 @@ class FlameTrackingSingleImage:
         os.makedirs(output_mask_dir, exist_ok=True)
         os.makedirs(output_alpha_map_dir, exist_ok=True)
 
+        preprocess_meta = {
+            "source_image": os.path.abspath(input_image_path),
+            "original_size": [int(frame.shape[2]), int(frame.shape[1])],
+            "crop_bbox_xyxy": [int(v) for v in frame_bbox.tolist()],
+            "crop_size": [1024, 1024],
+        }
+        with open(os.path.join(self.sub_output_dir, "preprocess_meta.json"), "w", encoding="utf-8") as fp:
+            json.dump(preprocess_meta, fp, indent=2)
+
         # Save processed image, mask and alpha map
         cv2.imwrite(os.path.join(output_image_dir, name_list[frame_index]),
                     saved_image)
@@ -203,6 +212,11 @@ class FlameTrackingSingleImage:
 
         # Landmark detection
         detections, _ = self.detector.detect(saved_image, 0.8, 1)
+        if detections is None or len(detections) == 0:
+            logger.error('Failed to detect face landmarks')
+            return ERROR_CODE['FailedToDetect']
+
+        face_landmarks = None
         for idx, detection in enumerate(detections):
             x1_ori, y1_ori = detection[2], detection[3]
             x2_ori, y2_ori = x1_ori + detection[4], y1_ori + detection[5]
@@ -214,6 +228,10 @@ class FlameTrackingSingleImage:
 
             face_landmarks = self.alignment.analyze(saved_image, scale,
                                                     center_w, center_h)
+
+        if face_landmarks is None:
+            logger.error('Failed to detect face landmarks')
+            return ERROR_CODE['FailedToDetect']
 
         # Normalize and save landmarks
         normalized_landmarks = np.zeros((face_landmarks.shape[0], 3))
@@ -252,7 +270,7 @@ class FlameTrackingSingleImage:
             config_data = safe_load(yml_f)
         config_data = tyro.from_yaml(BaseTrackingConfig, config_data)
 
-        config_data.data.sequence = self.sub_output_dir.split('/')[-1]
+        config_data.data.sequence = Path(self.sub_output_dir).name
         config_data.data.root_folder = Path(
             os.path.dirname(self.sub_output_dir))
 
@@ -331,7 +349,7 @@ class FlameTrackingSingleImage:
 
         src_folder = Path(self.output_tracking)
         tgt_folder = Path(self.output_export,
-                          self.sub_output_dir.split('/')[-1])
+                          Path(self.sub_output_dir).name)
         src_folder, config_data = load_config(src_folder)
 
         nerf_writer = NeRFDatasetWriter(config_data.data, tgt_folder, None,

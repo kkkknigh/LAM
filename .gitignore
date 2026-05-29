@@ -10,3 +10,8 @@ pretrain_model/
 pretrained_models/
 model_zoo/
 tracking_output/
+output/
+*.py[cod]
+*.pyd
+*.o
+pytorch3d/

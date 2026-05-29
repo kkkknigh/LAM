@@ -16,6 +16,7 @@ import os
 import cv2
 import sys
 import base64
+import json
 import subprocess
 
 import gradio as gr
@@ -37,6 +38,8 @@ try:
     import spaces
 except:
     pass
+
+from pathlib import Path
 
 
 h5_rendering = False  # True
@@ -203,16 +206,108 @@ def create_zip_archive(output_zip='runtime_/h5_render_data.zip', base_vid="nice"
         print(f"An error occurred: {e}")
 
 
+def _safe_stem(name):
+    stem = Path(name).stem
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return safe or "lam_input"
+
+
+def save_layer1_lam_package(base_iid, cano_gs, shape_param, frame_param_dir=None, reference_transforms_path=None, output_root="./output/layer1_lam"):
+    from datetime import datetime
+    import shutil
+
+    safe_iid = _safe_stem(base_iid)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    package_dir = Path(output_root) / f"{safe_iid}_{run_id}"
+    layer1_dir = package_dir / "layer1_lam"
+    flame_dst = layer1_dir / "flame_param"
+    layer1_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical_ply = layer1_dir / f"{safe_iid}_canonical.ply"
+    cano_gs.save_ply(str(canonical_ply), rgb2sh=False, offset2xyz=False)
+
+    shape = shape_param.detach().cpu().numpy()
+    np.savez(layer1_dir / "canonical_flame_param.npz", shape=shape, betas=shape)
+
+    xyz = cano_gs.xyz.detach().cpu().float().numpy()
+    canonical_center = xyz.mean(axis=0)
+    canonical_radius_p95 = float(np.percentile(np.linalg.norm(xyz - canonical_center, axis=1), 95))
+    metadata = {
+        "canonical_center": canonical_center.tolist(),
+        "canonical_radius_p95": canonical_radius_p95,
+    }
+
+    if reference_transforms_path and os.path.isfile(reference_transforms_path):
+        ref_dst = layer1_dir / "layer1_reference_transforms.json"
+        shutil.copy2(reference_transforms_path, ref_dst)
+        try:
+            ref_db = json.loads(Path(reference_transforms_path).read_text(encoding="utf-8"))
+            ref_frame = ref_db.get("frames", [None])[0]
+            if ref_frame is not None:
+                metadata["reference_camera"] = ref_frame
+        except Exception as e:
+            metadata["reference_camera_error"] = str(e)
+
+    (layer1_dir / "layer1_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    if frame_param_dir and os.path.isdir(frame_param_dir):
+        flame_dst.mkdir(parents=True, exist_ok=True)
+        for src in sorted(Path(frame_param_dir).glob("*.npz")):
+            shutil.copy2(src, flame_dst / src.name)
+
+    zip_path = package_dir / "layer1_lam.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for path in sorted(layer1_dir.rglob("*")):
+            if path.is_file():
+                zipf.write(path, arcname=str(path.relative_to(package_dir)).replace("\\", "/"))
+
+    print(f"Layer1 LAM package saved: {zip_path}")
+    return str(zip_path)
+
+
+def expand_motion_seq_for_turntable(motion_seq, num_views=49, yaw_degrees=60):
+    c2ws = motion_seq["render_c2ws"]
+    device = c2ws.device
+    dtype = c2ws.dtype
+    angles = torch.linspace(-yaw_degrees, yaw_degrees, num_views, device=device, dtype=dtype)
+    angles = angles * torch.pi / 180.0
+
+    rots = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(num_views, 1, 1)
+    cos, sin = torch.cos(angles), torch.sin(angles)
+    rots[:, 0, 0] = cos
+    rots[:, 0, 2] = sin
+    rots[:, 2, 0] = -sin
+    rots[:, 2, 2] = cos
+
+    base_c2w = c2ws[:, :1].clone()
+    turntable_c2ws = base_c2w.repeat(1, num_views, 1, 1)
+    turntable_c2ws[0] = torch.matmul(rots, base_c2w[0, 0])
+    motion_seq["render_c2ws"] = turntable_c2ws
+    motion_seq["render_intrs"] = motion_seq["render_intrs"][:, :1].repeat(1, num_views, 1, 1)
+    motion_seq["render_bg_colors"] = motion_seq["render_bg_colors"][:, :1].repeat(1, num_views, 1)
+
+    for key, value in list(motion_seq["flame_params"].items()):
+        if key != "betas" and value.ndim >= 3 and value.shape[1] == 1:
+            motion_seq["flame_params"][key] = value.repeat(1, num_views, *([1] * (value.ndim - 2)))
+    return motion_seq
+
+
 def demo_lam(flametracking, lam, cfg):
 
     # @spaces.GPU(duration=80)
     def core_fn(image_path: str, video_params, working_dir, enable_oac_file):
+        if isinstance(video_params, dict):
+            video_params = video_params.get("name") or video_params.get("path")
+
         image_raw = os.path.join(working_dir.name, "raw.png")
         with Image.open(image_path).convert('RGB') as img:
             img.save(image_raw)
-        
-        base_vid = os.path.basename(video_params).split(".")[0]
-        flame_params_dir = os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
+
+        base_vid = os.path.basename(video_params).split(".")[0] if video_params else None
+        sample_motion_dir = (
+            os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
+            if base_vid else None
+        )
         base_iid = os.path.basename(image_path).split('.')[0]
         image_path = os.path.join("./assets/sample_input", base_iid, "images/00000_00.png")
 
@@ -229,17 +324,15 @@ def demo_lam(flametracking, lam, cfg):
         )
         print("subdir_path and uid:", subdir_path, uid)
 
-        motion_seqs_dir = flame_params_dir
-
         dump_image_dir = os.path.dirname(dump_image_path)
         os.makedirs(dump_image_dir, exist_ok=True)
 
-        print(image_raw, motion_seqs_dir, dump_image_dir, dump_video_path)
+        print(image_raw, sample_motion_dir, dump_image_dir, dump_video_path)
 
         dump_tmp_dir = dump_image_dir
 
         if os.path.exists(dump_video_path):
-            return dump_image_path, dump_video_path
+            return dump_image_path, dump_video_path, ""
 
         motion_img_need_mask = cfg.get("motion_img_need_mask", False)  # False
         vis_motion = cfg.get("vis_motion", False)  # False
@@ -270,18 +363,25 @@ def demo_lam(flametracking, lam, cfg):
         vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
         Image.fromarray(vis_ref_img).save(save_ref_img_path)
 
-        # prepare motion seq
-        src = image_path.split('/')[-3]
-        driven = motion_seqs_dir.split('/')[-2]
+        # prepare motion seq. If no driving video is selected, use the single image
+        # tracking result so the app can run as image-only reconstruction.
+        motion_seqs_dir = sample_motion_dir or os.path.join(output_dir, "flame_param")
+        if not os.path.isdir(motion_seqs_dir):
+            raise gr.Error(f"Motion parameters not found: {motion_seqs_dir}")
+
+        src = Path(image_path).parent.parent.name
+        driven = Path(motion_seqs_dir).parent.name
         src_driven = [src, driven]
         motion_seq = prepare_motion_seqs(motion_seqs_dir, None, save_root=dump_tmp_dir, fps=render_fps,
-                                            bg_color=1., aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
+                                            bg_color=1., aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
                                             render_image_res=render_size,  multiply=16, 
                                             need_mask=motion_img_need_mask, vis_motion=vis_motion, 
                                             shape_param=shape_param, test_sample=False, cross_id=False, src_driven=src_driven)
 
         # start inference
         motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
+        if base_vid is None:
+            motion_seq = expand_motion_seq_for_turntable(motion_seq)
         device, dtype = "cuda", torch.float32
         print("start to inference...................")
         with torch.no_grad():
@@ -291,6 +391,14 @@ def demo_lam(flametracking, lam, cfg):
                                         render_intrs=motion_seq["render_intrs"].to(device),
                                         render_bg_colors=motion_seq["render_bg_colors"].to(device),
                                         flame_params={k:v.to(device) for k, v in motion_seq["flame_params"].items()})
+
+        layer1_zip_path = save_layer1_lam_package(
+            base_iid=base_iid,
+            cano_gs=res["cano_gs_lst"][0],
+            shape_param=shape_param,
+            frame_param_dir=os.path.join(output_dir, "flame_param"),
+            reference_transforms_path=os.path.join(output_dir, "transforms.json"),
+        )
         
         # save h5 rendering info
         if h5_rendering:
@@ -299,12 +407,13 @@ def demo_lam(flametracking, lam, cfg):
             res['cano_gs_lst'][0].save_ply(os.path.join(h5_fd, "offset.ply"), rgb2sh=False, offset2xyz=True)
             cmd = "thirdparties/blender/blender --background --python 'tools/generateGLBWithBlender_v2.py'"
             os.system(cmd)
-            create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
+            if base_vid:
+                create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
 
+        oac_zip_path = ''
         if enable_oac_file:
             try:
                 from tools.generateARKITGLBWithBlender import generate_glb
-                from pathlib import Path
                 import shutil
                 import patoolib
 
@@ -323,16 +432,16 @@ def demo_lam(flametracking, lam, cfg):
                 )
                 os.remove(saved_head_path)
 
-                output_zip_path = os.path.join('./output/open_avatar_chat', base_iid + '.zip')
-                if os.path.exists(output_zip_path):
-                    os.remove(output_zip_path)
+                oac_zip_path = os.path.join('./output/open_avatar_chat', base_iid + '.zip')
+                if os.path.exists(oac_zip_path):
+                    os.remove(oac_zip_path)
                 original_cwd = os.getcwd()
                 oac_parent_dir = os.path.dirname(oac_dir)
                 base_iid_dir = os.path.basename(oac_dir)
                 os.chdir(oac_parent_dir)
                 try:
                     patoolib.create_archive(
-                        archive=os.path.abspath(output_zip_path),
+                        archive=os.path.abspath(oac_zip_path),
                         filenames=[base_iid_dir],
                         verbosity=-1,
                         program='zip'
@@ -341,7 +450,7 @@ def demo_lam(flametracking, lam, cfg):
                     os.chdir(original_cwd)
                 shutil.rmtree(oac_dir)
             except Exception as e:
-                output_zip_path = f"Archive creation failed: {str(e)}"
+                oac_zip_path = f"Archive creation failed: {str(e)}"
 
         rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
         mask = res["comp_mask"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
@@ -358,11 +467,17 @@ def demo_lam(flametracking, lam, cfg):
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
 
         save_images2video(rgb, dump_video_path, render_fps)
-        audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
-        dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-        add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
+        dump_video_path_wa = dump_video_path
+        if base_vid:
+            audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
+            if os.path.exists(audio_path):
+                dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
+                add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
 
-        return dump_image_path, dump_video_path_wa, output_zip_path if enable_oac_file else ''
+        export_paths = f"Layer1 LAM ZIP: {layer1_zip_path}"
+        if enable_oac_file:
+            export_paths += f"\nOAC ZIP: {oac_zip_path}"
+        return dump_image_path, dump_video_path_wa, export_paths
 
     with gr.Blocks(analytics_enabled=False) as demo:
 
@@ -412,7 +527,7 @@ def demo_lam(flametracking, lam, cfg):
                         examples_per_page=20,
                     )
 
-            with gr.Column():
+            with gr.Column(variant='panel', scale=1):
                 with gr.Tabs(elem_id='lam_input_video'):
                     with gr.TabItem('Input Video'):
                         with gr.Row():
@@ -462,8 +577,8 @@ def demo_lam(flametracking, lam, cfg):
                 output_zip_textbox = gr.Textbox(
                     label="Export ZIP File Path",
                     interactive=False,
-                    placeholder="Export ZIP File Path ...",
-                    visible=os.path.exists(cfg.blender_path)
+                    placeholder="Layer1 LAM ZIP path ...",
+                    visible=True
                 )
 
         if h5_rendering:
@@ -492,7 +607,9 @@ def demo_lam(flametracking, lam, cfg):
         )
 
         demo.queue()
-        demo.launch()
+        server_name = os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")
+        server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+        demo.launch(server_name=server_name, server_port=server_port)
 
 
 def _build_model(cfg):
