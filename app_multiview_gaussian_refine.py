@@ -233,6 +233,140 @@ def render_final_review(workspace):
     return result.path, result.message, [str(p) for p in overlays], str(video) if video.exists() else None
 
 
+def process_all(camera_images_zip, layer1_lam_zip, workspace):
+    workspace_gallery = []
+    flame_gallery = []
+    colmap_plot = None
+    alignment_plot = None
+    alignment_gallery = []
+    refine_gallery = []
+    loss_plot = None
+    review_gallery = []
+    review_video = None
+    latest_output = ""
+    status_lines = []
+
+    def outputs():
+        return (
+            workspace,
+            workspace,
+            latest_output,
+            "\n".join(status_lines),
+            workspace_gallery,
+            flame_gallery,
+            colmap_plot,
+            alignment_plot,
+            alignment_gallery,
+            refine_gallery,
+            loss_plot,
+            review_gallery,
+            review_video,
+        )
+
+    def record(step, result):
+        nonlocal latest_output
+        latest_output = result.path
+        status_lines.append(f"[{step}] {result.message}")
+
+    try:
+        if camera_images_zip and layer1_lam_zip:
+            pipe = MultiViewRefinePipeline.create(DEFAULT_OUTPUT_ROOT, None)
+            camera_zip_path = camera_images_zip.name if hasattr(camera_images_zip, "name") else camera_images_zip
+            layer1_zip_path = layer1_lam_zip.name if hasattr(layer1_lam_zip, "name") else layer1_lam_zip
+            result = pipe.unpack_uploads(camera_zip_path, layer1_zip_path)
+            workspace = str(pipe.workspace.root)
+            workspace_gallery = _gallery(result.path)
+            record("1/11 Workspace", result)
+            yield outputs()
+        elif workspace:
+            pipe = _pipe(workspace)
+            workspace = str(pipe.workspace.root)
+            existing_preview = Path(workspace) / "debug" / "00_inputs"
+            workspace_gallery = _gallery(existing_preview)
+            status_lines.append(f"[1/11 Workspace] Using existing workspace: {workspace}")
+            latest_output = workspace
+            yield outputs()
+        else:
+            raise gr.Error("Upload both ZIP files or create/select a workspace first.")
+
+        result = pipe.generate_masks_and_flame()
+        flame_gallery = _gallery(result.path)
+        record("2/11 Masks / FLAME", result)
+        yield outputs()
+
+        result = pipe.run_colmap(DEFAULT_COLMAP_PATH)
+        colmap_plot = _image(result.path)
+        record("3/11 COLMAP", result)
+        yield outputs()
+
+        status_lines.append("Loading LAM model for alignment and refinement.")
+        yield outputs()
+        lam = build_lam()
+
+        result = pipe.initialize_sim3_from_layer1(lam)
+        alignment_plot = _image(result.path)
+        record("4/11 Initialize Alignment", result)
+        status_lines.append(_projection_score_text(Path(workspace)))
+        yield outputs()
+
+        result = pipe.calibrate_global_sim3_blackbox(lam)
+        alignment_plot = _image(result.path)
+        record("5/11 Calibrate Alignment", result)
+        yield outputs()
+
+        result = pipe.preview_alignment(lam, None)
+        alignment_gallery = [str(p) for p in sorted(Path(result.path).glob("*.png"))]
+        record("6/11 Preview Alignment", result)
+        status_lines.append(_alignment_status_text(Path(workspace)))
+        yield outputs()
+
+        default_stages = {stage.name: stage for stage in RefinementConfig().stages}
+        stages = [replace(default_stages[name]) for name in ["camera", "pose", "appearance"]]
+        config = RefinementConfig(stages=stages, output_dir=str(Path(workspace) / "refine"))
+        result = pipe.refine(lam, None, config, resume=None)
+        refine_gallery = _latest_refine_gallery(workspace, "appearance")
+        loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
+        record("7/11 Refinement", result)
+        yield outputs()
+
+        geometry_stage = replace(default_stages["geometry_light"])
+        geometry_config = RefinementConfig(stages=[geometry_stage], output_dir=str(Path(workspace) / "refine"))
+        latest_checkpoint = Path(workspace) / "refine" / "checkpoints" / "latest.pt"
+        result = pipe.refine(lam, None, geometry_config, resume=str(latest_checkpoint) if latest_checkpoint.exists() else None)
+        refine_gallery = _latest_refine_gallery(workspace, "geometry_light")
+        loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
+        record("8/11 Geometry", result)
+        yield outputs()
+
+        xyz_stage = replace(default_stages["geometry_xyz"])
+        xyz_loss_weights = replace(RefinementConfig().loss_weights, xyz_anchor=0.01, knn_anchor=0.004, scale_limit=0.002)
+        xyz_config = RefinementConfig(stages=[xyz_stage], output_dir=str(Path(workspace) / "refine"))
+        xyz_config.loss_weights = xyz_loss_weights
+        latest_checkpoint = Path(workspace) / "refine" / "checkpoints" / "latest.pt"
+        result = pipe.refine(lam, None, xyz_config, resume=str(latest_checkpoint) if latest_checkpoint.exists() else None)
+        refine_gallery = _latest_refine_gallery(workspace, "geometry_xyz")
+        loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
+        record("9/11 Small XYZ Geometry", result)
+        yield outputs()
+
+        result = pipe.export()
+        record("10/11 Export", result)
+        yield outputs()
+
+        result = pipe.export_final_review(lam)
+        review_dir = Path(result.path)
+        review_gallery = [str(p) for p in sorted((review_dir / "overlays").glob("*.png"))]
+        review_video_path = review_dir / "final_review.mp4"
+        review_video = str(review_video_path) if review_video_path.exists() else None
+        record("11/11 Final Review", result)
+        status_lines.append("Full multi-view process complete. package.zip and final_review.zip are ready in the export directory.")
+        yield outputs()
+    except Exception as exc:
+        status_lines.append(f"FAILED: {type(exc).__name__}: {exc}")
+        yield outputs()
+        raise
+
+
 def workspace_status(workspace):
     if not workspace:
         return "No workspace selected."
@@ -300,7 +434,9 @@ def launch():
         with gr.Row():
             camera_images_zip = gr.File(label="Camera Images ZIP", file_types=[".zip"])
             layer1_lam_zip = gr.File(label="LAM Canonical Package ZIP", file_types=[".zip"])
-        create_btn = gr.Button("Create Workspace", variant="primary")
+        with gr.Row():
+            create_btn = gr.Button("Create Workspace")
+            process_all_btn = gr.Button("Process All", variant="primary")
         workspace_gallery = gr.Gallery(label="Input Preview", columns=2, height=480)
         create_btn.click(
             create_workspace,
@@ -353,6 +489,25 @@ def launch():
         review_video = gr.Video(label="Final Review Video", format="mp4", height=360)
         export_btn.click(export, [workspace], [output_path, status])
         review_btn.click(render_final_review, [workspace], [output_path, status, review_gallery, review_video])
+        process_all_btn.click(
+            process_all,
+            [camera_images_zip, layer1_lam_zip, workspace],
+            [
+                workspace,
+                workspace_display,
+                output_path,
+                status,
+                workspace_gallery,
+                flame_gallery,
+                colmap_plot,
+                alignment_plot,
+                alignment_gallery,
+                refine_gallery,
+                loss_plot,
+                review_gallery,
+                review_video,
+            ],
+        )
         refresh_btn.click(workspace_status, [workspace], [status])
 
         demo.queue(concurrency_count=1, max_size=2)

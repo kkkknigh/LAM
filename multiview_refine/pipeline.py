@@ -434,9 +434,62 @@ class MultiViewRefinePipeline:
             shutil.copy2(src, self.workspace.exports_dir / f"{src.stem}.initial{src.suffix}")
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
             for path in sorted(self.workspace.exports_dir.rglob("*")):
-                if path.is_file() and path != package_path:
-                    zipf.write(path, arcname=str(path.relative_to(self.workspace.exports_dir)).replace("\\", "/"))
+                if not path.is_file() or path == package_path:
+                    continue
+                rel_path = path.relative_to(self.workspace.exports_dir)
+                if rel_path.parts and rel_path.parts[0] == "final_review":
+                    continue
+                if path.name == "final_review.zip":
+                    continue
+                zipf.write(path, arcname=str(rel_path).replace("\\", "/"))
         return StepResult("Export ready", str(self.workspace.exports_dir))
+
+    def export_final_review(self, lam_model, fps: int = 6, max_views: int = 24) -> StepResult:
+        if not self.workspace.refined_gaussian_path.exists():
+            raise FileNotFoundError(f"Missing refined Gaussian: {self.workspace.refined_gaussian_path}")
+
+        out_dir = self.workspace.exports_dir / "final_review"
+        overlays_dir = out_dir / "overlays"
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        overlays_dir.mkdir(parents=True, exist_ok=True)
+
+        batch = load_multiview_bundle(self.workspace.root, require_undistorted=False).to("cuda", torch.float32)
+        gs = _load_renderable_gaussian(self.workspace.refined_gaussian_path)
+        gs.to_cuda()
+        query_points, flame_params = lam_model.renderer.get_query_points(batch.flame_params, device=batch.images.device)
+        h, w = batch.images.shape[-2:]
+        with torch.no_grad():
+            out = render_animate_gs_with_intrinsics(lam_model.renderer, [gs], query_points, flame_params, batch.c2ws, batch.intrs, h, w, batch.bg_colors)
+
+        saved = save_overlay_grid(
+            overlays_dir,
+            batch.frame_ids,
+            batch.images.detach().cpu(),
+            batch.masks.detach().cpu(),
+            out["comp_rgb"].detach().cpu(),
+            out["comp_mask"].detach().cpu(),
+            batch.landmarks_2d.detach().cpu() if batch.landmarks_2d is not None else None,
+            max_items=max_views,
+        )
+
+        rgb = out["comp_rgb"][0].detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
+        mask = out["comp_mask"][0].detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
+        frames = (rgb * mask + (1.0 - mask) * 1.0).clip(0, 1)
+        frames = (frames * 255.0).astype(np.uint8)
+        video_path = out_dir / "final_review.mp4"
+        from lam.utils.video import images_to_video
+        images_to_video(frames, str(video_path), int(fps), gradio_codec=True)
+
+        zip_path = self.workspace.exports_dir / "final_review.zip"
+        if zip_path.exists():
+            zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+            for path in sorted(out_dir.rglob("*")):
+                if path.is_file():
+                    zipf.write(path, arcname=str(path.relative_to(out_dir)).replace("\\", "/"))
+
+        return StepResult(f"Final review ready. Overlays: {len(saved)}", str(out_dir))
 
     def _merge_tracking_exports(self, exports: list[Path], preserve_existing_masks: bool = True) -> int:
         for directory in [self.workspace.masks_dir, self.workspace.flame_dir, self.workspace.landmark_dir]:
