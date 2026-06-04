@@ -422,6 +422,14 @@ class MultiViewRefinePipeline:
         export_required = [self.workspace.refined_gaussian_path, self.workspace.canonical_flame_path]
         for src in export_required + [path for path in optional if path.exists()]:
             shutil.copy2(src, self.workspace.exports_dir / src.name)
+        flame_export_dir = self.workspace.exports_dir / "data" / "flame_param"
+        if flame_export_dir.exists():
+            shutil.rmtree(flame_export_dir)
+        flame_files = sorted(self.workspace.flame_dir.glob("*.npz")) if self.workspace.flame_dir.exists() else []
+        if flame_files:
+            flame_export_dir.mkdir(parents=True, exist_ok=True)
+            for src in flame_files:
+                shutil.copy2(src, flame_export_dir / src.name)
         for src in [self.workspace.sim3_path, self.workspace.aligned_transforms_path]:
             shutil.copy2(src, self.workspace.exports_dir / f"{src.stem}.initial{src.suffix}")
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
