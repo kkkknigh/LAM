@@ -11,3 +11,4 @@ pretrained_models/
 model_zoo/
 tracking_output/
 output/
+tmp/

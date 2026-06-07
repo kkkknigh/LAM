@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from .workspace import find_stem_file
+
 
 def save_overlay_grid(
     out_dir: str | Path,
@@ -280,10 +282,9 @@ def _load_mask_uint8(path: Path, image_hw: tuple[int, int]) -> np.ndarray:
 def _find_by_stem(root: Path, stem: str, dirs: List[str], suffixes: List[str]) -> Optional[Path]:
     for dirname in dirs:
         base = root / dirname
-        for suffix in suffixes:
-            candidate = base / f"{stem}{suffix}"
-            if candidate.exists():
-                return candidate
+        candidate = find_stem_file(base, stem, suffixes)
+        if candidate is not None:
+            return candidate
     return None
 
 

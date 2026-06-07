@@ -2,7 +2,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -149,6 +149,7 @@ class RefinementConfig:
     require_undistorted: bool = True
     use_local_projection_adapter: bool = True
     log_grad_diagnostics: bool = True
+    train_view_indices: Optional[List[int]] = None
 
 
 @dataclass
@@ -186,7 +187,7 @@ class MultiViewGaussianRefiner:
         intr_state = OptimizableIntrinsicsState(batch.c2ws.shape[1]).to(device=device)
         exposure_state = OptimizableExposureState(batch.c2ws.shape[1]).to(device=device)
         expr_state = OptimizableExpressionState(batch.flame_params).to(device=device)
-        sampler = RoundRobinViewSampler(batch.c2ws.shape[1], device=device)
+        sampler = RoundRobinViewSampler(batch.c2ws.shape[1], device=device, allowed_indices=self.config.train_view_indices)
         start_stage, start_step = 0, 0
         if resume:
             start_stage, start_step = self._load_checkpoint(
@@ -400,28 +401,42 @@ class MultiViewGaussianRefiner:
 
 
 class RoundRobinViewSampler:
-    def __init__(self, num_views: int, device) -> None:
+    def __init__(self, num_views: int, device, allowed_indices: Optional[Sequence[int]] = None) -> None:
         self.num_views = num_views
         self.device = device
-        self.order = torch.randperm(num_views, device=device)
+        if allowed_indices is None:
+            base = list(range(num_views))
+        else:
+            seen = set()
+            base = []
+            for value in allowed_indices:
+                idx = int(value)
+                if 0 <= idx < num_views and idx not in seen:
+                    seen.add(idx)
+                    base.append(idx)
+        if not base:
+            raise ValueError("RoundRobinViewSampler requires at least one valid training view index.")
+        self.allowed_indices = torch.as_tensor(base, device=device, dtype=torch.long)
+        self.num_allowed = int(self.allowed_indices.numel())
+        self.order = self.allowed_indices[torch.randperm(self.num_allowed, device=device)]
         self.cursor = 0
 
     def reset(self) -> None:
-        self.order = torch.randperm(self.num_views, device=self.device)
+        self.order = self.allowed_indices[torch.randperm(self.num_allowed, device=self.device)]
         self.cursor = 0
 
     def next(self, views_per_step: int) -> torch.Tensor:
-        if views_per_step <= 0 or views_per_step >= self.num_views:
-            return torch.arange(self.num_views, device=self.device)
+        if views_per_step <= 0 or views_per_step >= self.num_allowed:
+            return self.allowed_indices.clone()
         chunks = []
         remaining = views_per_step
         while remaining > 0:
-            available = self.num_views - self.cursor
+            available = self.num_allowed - self.cursor
             take = min(remaining, available)
             chunks.append(self.order[self.cursor:self.cursor + take])
             self.cursor += take
             remaining -= take
-            if self.cursor >= self.num_views:
+            if self.cursor >= self.num_allowed:
                 self.reset()
         return torch.cat(chunks).sort()[0]
 
@@ -585,14 +600,18 @@ class OptimizableIntrinsicsState(nn.Module):
         if view_indices is None:
             view_indices = torch.arange(v, device=intrs.device)
         view_indices = view_indices.to(device=intrs.device, dtype=torch.long)
-        out = intrs.clone()
         focal_delta = self.max_log_focal * torch.tanh(self.log_focal_scale[view_indices])
         principal_delta = self.max_principal_delta * torch.tanh(self.principal_delta[view_indices])
-        out[:, :, 0, 0] = out[:, :, 0, 0] * torch.exp(focal_delta[:, 0]).unsqueeze(0)
-        out[:, :, 1, 1] = out[:, :, 1, 1] * torch.exp(focal_delta[:, 1]).unsqueeze(0)
-        out[:, :, 0, 2] = out[:, :, 0, 2] + principal_delta[:, 0].unsqueeze(0)
-        out[:, :, 1, 2] = out[:, :, 1, 2] + principal_delta[:, 1].unsqueeze(0)
-        return out
+        fx = intrs[:, :, 0, 0] * torch.exp(focal_delta[:, 0]).unsqueeze(0)
+        fy = intrs[:, :, 1, 1] * torch.exp(focal_delta[:, 1]).unsqueeze(0)
+        cx = intrs[:, :, 0, 2] + principal_delta[:, 0].unsqueeze(0)
+        cy = intrs[:, :, 1, 2] + principal_delta[:, 1].unsqueeze(0)
+
+        row0 = torch.stack([fx, intrs[:, :, 0, 1], cx, intrs[:, :, 0, 3]], dim=-1)
+        row1 = torch.stack([intrs[:, :, 1, 0], fy, cy, intrs[:, :, 1, 3]], dim=-1)
+        row2 = intrs[:, :, 2, :]
+        row3 = intrs[:, :, 3, :]
+        return torch.stack([row0, row1, row2, row3], dim=-2)
 
     def regularization(self) -> torch.Tensor:
         return torch.tanh(self.log_focal_scale).square().mean() + torch.tanh(self.principal_delta).square().mean()

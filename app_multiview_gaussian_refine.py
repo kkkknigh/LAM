@@ -101,7 +101,17 @@ def initialize_sim3(workspace):
     lam = build_lam()
     result = _pipe(workspace).initialize_sim3_from_layer1(lam)
     score = _projection_score_text(Path(workspace))
-    return result.path, f"{result.message}\n{score}\nNext: preview alignment, then calibrate alignment if the overlay is not tight.", _image(result.path)
+    return result.path, f"{result.message}\n{score}\nNext: run Align Cameras.", _image(result.path)
+
+
+def align_cameras(workspace):
+    if not workspace:
+        raise gr.Error("Create or select a workspace first.")
+    lam = build_lam()
+    result = _pipe(workspace).align_cameras(lam)
+    status = _alignment_status_text(Path(workspace))
+    score = _projection_score_text(Path(workspace))
+    return result.path, f"{result.message}\n{score}\n{status}\nNext: preview alignment.", _image(result.path), []
 
 
 def preview(workspace):
@@ -109,7 +119,7 @@ def preview(workspace):
     result = _pipe(workspace).preview_alignment(lam, None)
     gallery = sorted(Path(result.path).glob("*.png"))
     status = _alignment_status_text(Path(workspace))
-    return result.path, f"{result.message}\n{status}\nNext: calibrate alignment before refinement if face position/scale is still offset.", [str(p) for p in gallery]
+    return result.path, f"{result.message}\n{status}\nNext: run refinement if the overlay is tight.", [str(p) for p in gallery]
 
 
 def calibrate_alignment(workspace):
@@ -119,7 +129,7 @@ def calibrate_alignment(workspace):
     result = _pipe(workspace).calibrate_global_sim3_blackbox(lam)
     return (
         result.path,
-        f"{result.message}\nNext: preview alignment, then run refinement.",
+        f"{result.message}\nNext: preview alignment.",
         _image(result.path),
         [],
     )
@@ -233,6 +243,17 @@ def render_final_review(workspace):
     return result.path, result.message, [str(p) for p in overlays], str(video) if video.exists() else None
 
 
+def render_pose_transition_demo(workspace):
+    if not workspace:
+        raise gr.Error("Create or select a workspace first.")
+    lam = build_lam()
+    result = _pipe(workspace).export_pose_transition_demo(lam)
+    review_dir = Path(result.path)
+    peaks = sorted((review_dir / "peaks").glob("*.png"))
+    video = review_dir / "pose_transition_demo.mp4"
+    return result.path, result.message, [str(p) for p in peaks], str(video) if video.exists() else None
+
+
 def process_all(camera_images_zip, layer1_lam_zip, workspace):
     workspace_gallery = []
     flame_gallery = []
@@ -303,21 +324,16 @@ def process_all(camera_images_zip, layer1_lam_zip, workspace):
         yield outputs()
         lam = build_lam()
 
-        result = pipe.initialize_sim3_from_layer1(lam)
+        result = pipe.align_cameras(lam)
         alignment_plot = _image(result.path)
-        record("4/11 Initialize Alignment", result)
+        record("4/11 Align Cameras", result)
         status_lines.append(_projection_score_text(Path(workspace)))
-        yield outputs()
-
-        result = pipe.calibrate_global_sim3_blackbox(lam)
-        alignment_plot = _image(result.path)
-        record("5/11 Calibrate Alignment", result)
+        status_lines.append(_alignment_status_text(Path(workspace)))
         yield outputs()
 
         result = pipe.preview_alignment(lam, None)
         alignment_gallery = [str(p) for p in sorted(Path(result.path).glob("*.png"))]
-        record("6/11 Preview Alignment", result)
-        status_lines.append(_alignment_status_text(Path(workspace)))
+        record("5/11 Preview Alignment", result)
         yield outputs()
 
         default_stages = {stage.name: stage for stage in RefinementConfig().stages}
@@ -326,7 +342,7 @@ def process_all(camera_images_zip, layer1_lam_zip, workspace):
         result = pipe.refine(lam, None, config, resume=None)
         refine_gallery = _latest_refine_gallery(workspace, "appearance")
         loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
-        record("7/11 Refinement", result)
+        record("6/11 Refinement", result)
         yield outputs()
 
         geometry_stage = replace(default_stages["geometry_light"])
@@ -335,7 +351,7 @@ def process_all(camera_images_zip, layer1_lam_zip, workspace):
         result = pipe.refine(lam, None, geometry_config, resume=str(latest_checkpoint) if latest_checkpoint.exists() else None)
         refine_gallery = _latest_refine_gallery(workspace, "geometry_light")
         loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
-        record("8/11 Geometry", result)
+        record("7/11 Geometry", result)
         yield outputs()
 
         xyz_stage = replace(default_stages["geometry_xyz"])
@@ -346,11 +362,11 @@ def process_all(camera_images_zip, layer1_lam_zip, workspace):
         result = pipe.refine(lam, None, xyz_config, resume=str(latest_checkpoint) if latest_checkpoint.exists() else None)
         refine_gallery = _latest_refine_gallery(workspace, "geometry_xyz")
         loss_plot = _image(Path(workspace) / "debug" / "05_refine" / "loss_history.png")
-        record("9/11 Small XYZ Geometry", result)
+        record("8/11 Small XYZ Geometry", result)
         yield outputs()
 
         result = pipe.export()
-        record("10/11 Export", result)
+        record("9/11 Export", result)
         yield outputs()
 
         result = pipe.export_final_review(lam)
@@ -358,7 +374,7 @@ def process_all(camera_images_zip, layer1_lam_zip, workspace):
         review_gallery = [str(p) for p in sorted((review_dir / "overlays").glob("*.png"))]
         review_video_path = review_dir / "final_review.mp4"
         review_video = str(review_video_path) if review_video_path.exists() else None
-        record("11/11 Final Review", result)
+        record("10/11 Final Review", result)
         status_lines.append("Full multi-view process complete. package.zip and final_review.zip are ready in the export directory.")
         yield outputs()
     except Exception as exc:
@@ -413,11 +429,52 @@ def _projection_score_text(workspace: Path) -> str:
     )
 
 
+def _alignment_view_subset_text(workspace: Path) -> str:
+    per_view_report = workspace / "alignment" / "per_view_camera_alignment_report.json"
+    if per_view_report.exists():
+        try:
+            data = json.loads(per_view_report.read_text(encoding="utf-8"))
+            selection = data.get("optimization_inlier_views") or {}
+            selected = [str(v) for v in selection.get("selected_frame_ids", [])]
+            outliers = [str(v) for v in selection.get("outlier_frame_ids", [])]
+            total = int(selection.get("num_views") or 0)
+            if selected and total > 0:
+                outlier_text = ", ".join(outliers[:8]) if outliers else "none"
+                if len(outliers) > 8:
+                    outlier_text += ", ..."
+                return (
+                    f"Refine view subset: {len(selected)}/{total} inlier views from per-view alignment; "
+                    f"outliers: {outlier_text}."
+                )
+        except Exception:
+            pass
+
+    calibration_report = workspace / "alignment" / "landmark_calibration_report.json"
+    if calibration_report.exists():
+        try:
+            data = json.loads(calibration_report.read_text(encoding="utf-8"))
+            selected = [str(v) for v in data.get("used_frame_ids", [])]
+            total = int((data.get("geometry_after") or {}).get("num_views") or data.get("num_views") or 0)
+            if selected and total > 0:
+                return f"Refine view subset: {len(selected)}/{total} views from global landmark calibration."
+        except Exception:
+            pass
+
+    return "Refine view subset: all views."
+
+
 def _alignment_status_text(workspace: Path) -> str:
     calibrated = workspace / "alignment" / "landmark_calibration_report.json"
     if calibrated.exists():
-        return "Alignment status: landmark calibrated. Use this preview for refinement decisions."
-    return "Alignment status: initial Sim3 only. This is coarse; Calibrate Alignment is expected before refinement when overlay is offset."
+        data = json.loads(calibrated.read_text(encoding="utf-8"))
+        if data.get("accepted") is False:
+            reason = data.get("acceptance_reason", "calibration failed sanity checks")
+            return f"Alignment status: initialization finished; global camera calibration was skipped ({reason})."
+        return (
+            "Alignment status: global camera calibration finished. "
+            + _alignment_view_subset_text(workspace)
+        )
+    return "Alignment status: cameras not aligned yet. Run Align Cameras before preview/refinement."
 
 
 def launch():
@@ -461,12 +518,14 @@ def launch():
 
         gr.Markdown("## 4. Camera Alignment / Calibration")
         with gr.Row():
-            init_sim3_btn = gr.Button("Initialize Alignment", variant="primary")
+            init_sim3_btn = gr.Button("Initialize Only")
+            align_btn = gr.Button("Align Cameras", variant="primary")
             preview_btn = gr.Button("Preview Alignment")
-            calibrate_btn = gr.Button("Calibrate Alignment")
+            calibrate_btn = gr.Button("Calibrate Only")
         alignment_plot = gr.Image(label="Camera Alignment", type="filepath", height=420)
         alignment_gallery = gr.Gallery(label="Alignment Overlays", columns=2, height=480)
         init_sim3_btn.click(initialize_sim3, [workspace], [output_path, status, alignment_plot])
+        align_btn.click(align_cameras, [workspace], [output_path, status, alignment_plot, alignment_gallery])
         preview_btn.click(preview, [workspace], [output_path, status, alignment_gallery])
         calibrate_btn.click(calibrate_alignment, [workspace], [output_path, status, alignment_plot, alignment_gallery])
 
@@ -485,10 +544,12 @@ def launch():
         with gr.Row():
             export_btn = gr.Button("Export Package", variant="primary")
             review_btn = gr.Button("Render Final Review")
+            transition_demo_btn = gr.Button("Render Pose Transition Demo")
         review_gallery = gr.Gallery(label="Final Review Overlays", columns=2, height=480)
         review_video = gr.Video(label="Final Review Video", format="mp4", height=360)
         export_btn.click(export, [workspace], [output_path, status])
         review_btn.click(render_final_review, [workspace], [output_path, status, review_gallery, review_video])
+        transition_demo_btn.click(render_pose_transition_demo, [workspace], [output_path, status, review_gallery, review_video])
         process_all_btn.click(
             process_all,
             [camera_images_zip, layer1_lam_zip, workspace],

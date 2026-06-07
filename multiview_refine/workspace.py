@@ -3,7 +3,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 @dataclass
@@ -206,8 +206,11 @@ def validate_workspace_inputs(workspace: MultiViewWorkspace, require_masks: bool
     masks = []
     if workspace.masks_dir.exists():
         masks = sorted([p for p in workspace.masks_dir.glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
-    mask_stems = {p.stem for p in masks}
-    missing_masks = [p.name for p in images if p.stem not in mask_stems]
+    missing_masks = [
+        p.name
+        for p in images
+        if find_stem_file(workspace.masks_dir, p.stem, [".png", ".jpg", ".jpeg"]) is None
+    ]
     if require_masks and missing_masks:
         raise FileNotFoundError(f"Missing masks for images: {missing_masks[:10]}")
     report = {
@@ -219,6 +222,33 @@ def validate_workspace_inputs(workspace: MultiViewWorkspace, require_masks: bool
         "has_init_ply": workspace.init_ply_path.exists(),
     }
     return report
+
+
+def find_stem_file(base: Path, stem: str, suffixes: Iterable[str]) -> Optional[Path]:
+    base = Path(base)
+    if not base.is_dir():
+        return None
+    suffixes = [suffix.lower() for suffix in suffixes]
+    for suffix in suffixes:
+        candidate = base / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    key = numeric_stem_key(stem)
+    if key is None:
+        return None
+    matches = [
+        path
+        for path in base.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in suffixes
+        and numeric_stem_key(path.stem) == key
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def numeric_stem_key(stem: str) -> Optional[int]:
+    text = str(stem)
+    return int(text) if text.isdigit() else None
 
 
 def _copy_dir(src: Path, dst: Path) -> None:

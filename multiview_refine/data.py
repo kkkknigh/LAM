@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from .types import FLAME_KEYS, MultiViewBatch, MultiViewFrame, TensorDict
+from .workspace import find_stem_file
 
 
 REQUIRED_FLAME_KEYS = FLAME_KEYS - {"teeth_bs"}
@@ -125,7 +126,11 @@ def write_lam_transforms_from_colmap(root: str | Path, colmap_json: str | Path, 
         frames.append(out)
     out_path = root / out_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({"frames": frames}, indent=2), encoding="utf-8")
+    payload = {"frames": frames}
+    for key in ["colmap_model_dir", "colmap_model_stats"]:
+        if key in db:
+            payload[key] = db[key]
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out_path
 
 
@@ -282,8 +287,7 @@ def _resolve_optional(root: Path, value: Optional[str], stem: str, dirs: List[st
             return path
     for dirname in dirs:
         base = root / dirname
-        for suffix in [".npz", ".png", ".jpg", ".jpeg"]:
-            candidate = base / f"{stem}{suffix}"
-            if candidate.exists():
-                return candidate
+        candidate = find_stem_file(base, stem, [".npz", ".png", ".jpg", ".jpeg"])
+        if candidate is not None:
+            return candidate
     return None
