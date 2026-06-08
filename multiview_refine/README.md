@@ -144,11 +144,3 @@ mask 语义约定：
 - final review 资源。
 
 建议通过 final review overlays 和视频检查相机对齐、轮廓质量、前景外观和表情响应。
-
-## 局限性
-
-- 结果依赖 Layer 1 LAM 初始化质量。
-- 如果初始 Gaussian 缺少完整侧面或背面区域，相关视角效果会受限。
-- 当前 geometry refinement 带有较强正则，不包含 densification、split 或 clone。
-- COLMAP 失败或 landmarks tracking 不准会影响相机对齐稳定性。
-
